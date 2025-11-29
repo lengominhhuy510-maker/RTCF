@@ -23,7 +23,18 @@ str(CIpur_lookup)
 # =========================
 # 1) NORMALIZE LOOKUPS
 # =========================
-
+norm_customer <- function(x){
+  x1 <- x %>%
+    stringr::str_replace_all("_"," ") %>%
+    stringr::str_squish()
+  
+  dplyr::case_when(
+    x1 %in% c("Food Groceries","Groceries") ~ "Food & Groceries",
+    x1 %in% c("Land Market","Landmark")    ~ "LAND Market",
+    x1 %in% c("Dominick s","Dominick")     ~ "Dominick's",
+    TRUE ~ x1
+  )
+}
 # ---- (1A) Sales CI lookup normalize ----
 CIsale_lookup <- CIsale_lookup %>%
   clean_names() %>% 
@@ -35,16 +46,10 @@ CIsale_lookup <- CIsale_lookup %>%
     payment_term         = payment_term,
     promotion_horizon    = promotion_horizon,
     shelf_life           = shelflife,
-    ci_promised          = contract_index,
-    customer_lookup      = customer
+    ci_promised          = contract_index
   ) %>%
   mutate(
-    customer = recode(customer_lookup,
-                      "Groceries" = "Food & Groceries",
-                      "Landmark"  = "LAND Market",
-                      "Dominick"  = "Dominick's",
-                      .default = customer_lookup),
-    
+    customer = norm_customer(customer),##
     promotional_pressure = str_to_lower(promotional_pressure),
     trade_unit           = str_to_lower(trade_unit),
     promotion_horizon    = str_to_lower(promotion_horizon),
@@ -204,6 +209,8 @@ customer_master <- tibble(
   pref_small_pack=c(FALSE,FALSE,TRUE),
   maturity=c("high","low","medium")
 )
+customer_master <- customer_master %>%
+  mutate(customer = norm_customer(customer))##
 
 sales_area_cp <- sales_area_cp %>%
   mutate(sales_price = as.numeric(str_remove_all(sales_price, "[€ ]")))
@@ -218,6 +225,9 @@ sales_area_cp <- sales_area_cp %>%
     sl_orderlines=service_level_order_lines,
     demand_value_per_w=demand_value_per_week,
     gross_margin_per_w=gross_margin_per_week_6
+  )%>%
+  mutate(
+    customer = norm_customer(customer)
   )
 
 benchmark_demand <- sales_area_cp %>% select(customer, sku, demand_week_pieces)
@@ -310,12 +320,22 @@ df_sku %>%
   filter(is.na(units_per_pallet) | units_per_pallet <= 0) %>%
   select(sku, units_per_pallet)#check
 # promo uplift midpoint
-get_promo_uplift <- function(pressure){
+get_promo_uplift <- function(p){
   tab <- sales_constants$promotion_uplift$basic
-  row <- tab %>% filter(pressure==!!pressure)
+  row <- tab %>% dplyr::filter(.data$pressure == p)
   (row$uplift_min + row$uplift_max)/2
 }
-
+#Empty flow 
+make_empty_flows <- function(){
+  list(
+    sales       = tibble(),
+    production  = tibble(),
+    purchasing  = tibble(),
+    inventory   = tibble(),
+    warehousing = tibble(),
+    distribution= tibble()
+  )
+}
 # =========================
 # 4) DECISIONS: BUILD SALES & PURCH PARAMS DEFAULT
 # =========================
@@ -342,6 +362,7 @@ sales_decision_cp <- make_sales_decisions(
   skus      = unique(df_sku$sku)
 ) %>%
   mutate(
+    customer             = norm_customer(customer),   #
     promotional_pressure = str_to_lower(promotional_pressure),
     trade_unit           = str_to_lower(trade_unit),
     promotion_horizon    = str_to_lower(promotion_horizon),
@@ -358,7 +379,6 @@ sales_ci_key <- c("customer","promotional_pressure","order_deadline","service_le
 sales_decision_cp <- sales_decision_cp %>%
   left_join(CIsale_lookup, by=sales_ci_key) %>%
   mutate(ci_promised = replace_na(ci_promised, 1))
-
 
 # ---- purchasing supplier_params default ----
 # Phase 1 bạn chưa scrape decision purchasing param => set baseline
@@ -398,6 +418,10 @@ sales_demand_week <- function(week, state, sales_decision_cp, sales_constants, e
   
   dem <- bench %>%
     left_join(vf, by="customer") %>%
+    mutate(
+      volume_factor = replace_na(volume_factor, 1),               # <<<<<< FIX
+      demand_week_pieces = as.numeric(demand_week_pieces)         # <<<<<< FIX an toàn
+    ) %>%
     left_join(sales_decision_cp %>% select(customer, sku, promotional_pressure, ci_promised),
               by=c("customer","sku")) %>%
     mutate(
@@ -682,7 +706,9 @@ constants <- list(
 )
 
 exo <- list(
-  volume_factor = tibble(customer=unique(customer_master$customer), volume_factor=1)
+  volume_factor = sales_area_cp %>%
+    distinct(customer) %>%
+    mutate(volume_factor = 1)
 )
 
 # =========================
