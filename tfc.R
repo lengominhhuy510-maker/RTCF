@@ -260,6 +260,11 @@ sc_constants <- list(
 )
 
 ##Sale constrant
+unique(sales_area_cp)
+colnames(sales_area_cp)
+str(sales_area_cp$sales_price)
+sales_area_cp <- sales_area_cp %>%
+  mutate(sales_price = as.numeric(str_remove_all(sales_price, pattern = "[€ ]")))
 customer_master <- tibble::tribble(
   ~customer, ~value_for_money, ~market_share, ~pref_small_pack, ~maturity,
   "Food & Groceries", TRUE, 0.10, FALSE, "high",
@@ -268,16 +273,16 @@ customer_master <- tibble::tribble(
 )
 sales_area_cp <- sales_area_cp %>%
   rename(
-    customer = `Customer - Sales Area`,
-    sku = `Product`,
-    demand_week_pieces =`Demand per week (pieces)`,
-    promo_additional_pct = `Additional sales as a result of promotions (%)`,
-    sl_pieces = `Service level (pieces)`,
-    sl_orderlines = `Service level (order lines)`,
-    sales_price = `Sales price`,
-    demand_value_per_w = `Demand value per week`,
-    percen_gross_margin_each_piece= `Gross margin per piece`,
-    gross_margin_per_w = `Gross margin per week...6`)
+    customer = `customer_sales_area`,
+    sku = `product`,
+    demand_week_pieces =`demand_per_week_pieces`,
+    promo_additional_pct = `additional_sales_as_a_result_of_promotions`,
+    sl_pieces = `service_level_pieces`,
+    sl_orderlines = `service_level_order_lines`,
+    sales_price = `sales_price`,
+    demand_value_per_w = `demand_value_per_week`,
+    percen_gross_margin_each_piece= `gross_margin_per_piece`,
+    gross_margin_per_w = `gross_margin_per_week_6`)
 # ============================================================
 # Benchmark demand (base demand): use to predoct demand next round
 # ============================================================
@@ -517,16 +522,15 @@ state0_round <- list(
 unique(df_sku)
 decisions_round <- list(
   sales = list(
-    customer_level = tibble(...),
-    customer_product_level = tibble(...)
+    customer_level = tibble(),
+    customer_product_level = tibble()
   ),
   purchasing = list(
     chosen_suppliers = tibble(component=c("Pack","PET","Orange","Mango","Vitamin C"),
                               supplier_primary=c("Mono Packaging Materials","Trio PET PLC",
                                                  "Miami Oranges","NO8DO Mango","Seitan Vitamins"), 
                               supplier_secondary= NULL),
-    supplier_params  = tibble(component, quality, delivery_window, delivery_reliability,
-                              trade_unit, payment_term)
+    supplier_params  = tibble()
   ),
   supply_chain = list(
     rm_safety_stock_w = c(Pack=2, PET=3, Orange=2, Mango=2, `Vitamin C`=2.5),
@@ -548,3 +552,564 @@ decisions_round <- list(
     mixer_type = "Fruitmix MQ"
   )
 )
+exo <- list(
+  volume_factor = sales_constants$observed$benchmark_demand %>%
+    distinct(customer) %>%
+    mutate(volume_factor = 1)
+)
+lookups <- list(
+  df_sku       = df_sku,
+  df_component = df_component,
+  CIpur_lookup = CIpur_lookup,
+  CIsale_lookup = CIsale_lookup
+)
+
+constants <- list(
+  sales        = sales_constants,
+  purchasing   = purchasing_constants,
+  supply_chain = sc_constants,
+  operations   = operations_constants,
+  finance      = finance_constants
+)
+##
+unique(CIsale_lookup$Customer) 
+make_sales_decisions <- function(customers, skus){
+  expand.grid(
+    customer = customers,
+    sku = skus
+  ) %>%
+    as_tibble() %>%
+    mutate(
+      service_level_type = "Order lines",
+      service_level = 95,
+      shelf_life = 40,
+      order_deadline = "14:00 pm",
+      trade_unit = "Box",
+      promotion_pressure = "None",
+      promotion_horizon = "Short",
+      payment_term = 4
+    )
+}
+
+sales_decision_cp <- make_sales_decisions(
+  customers = unique(sales_constants$customer_master$customer),
+  skus = unique(df_sku$sku)
+) %>%
+  left_join(CIsale_lookup, by = c( "customer","sku",
+                                   "service_level_type","service_level",
+                                   "shelf_life","order_deadline",
+                                   "trade_unit","promotion_pressure",
+                                   "promotion_horizon","payment_term"))
+##engine
+# ============================================================
+# 0) EMPTY FLOWS
+# ============================================================
+make_empty_flows <- function() {
+  list(
+    sales = tibble(),
+    production = tibble(),
+    purchasing = tibble(),
+    inventory = tibble(),
+    warehousing = tibble(),
+    distribution = tibble()
+  )
+}
+
+# ============================================================
+# 1) DEMAND generation (Sales) - Phase 1
+# demand = benchmark * volume_factor * (1 + promo_uplift)
+# CI_promised lookup từ CIsale_lookup (nếu thiếu thì =1)
+# ============================================================
+sales_demand_week <- function(week, state, decisions_sales, sales_constants,
+                              ci_sales_lookup, exogenous = list()) {
+  
+  bench <- sales_constants$observed$benchmark_demand
+  
+  # volume factor exogenous (nếu không có thì =1)
+  vf <- exogenous$volume_factor
+  if (is.null(vf)) {
+    vf <- tibble(customer = unique(bench$customer), volume_factor = 1)
+  }
+  
+  # promo uplift: lấy từ decisions hoặc observed nếu decisions chưa fill
+  if (!is.null(decisions_sales$customer_product_level)) {
+    promo_dec <- decisions_sales$customer_product_level %>%
+      select(customer, sku, promotion_pressure)
+  } else {
+    promo_dec <- bench %>%
+      mutate(promotion_pressure = "none") %>%
+      select(customer, sku, promotion_pressure)
+  }
+  
+  get_promo_uplift <- function(pressure, customer_type="basic", slowmover=FALSE) {
+    tab <- sales_constants$promotion_uplift$basic
+    row <- tab[tab$pressure == pressure, , drop=FALSE]
+    uplift <- (row$uplift_min + row$uplift_max)/2
+    
+    if (customer_type == "value_for_money") uplift <- uplift * sales_constants$promotion_uplift$value_for_money_multiplier
+    if (slowmover) uplift <- uplift * sales_constants$promotion_uplift$slowmover_multiplier
+    
+    uplift
+  }
+  
+  dem <- bench %>%
+    left_join(vf, by="customer") %>%
+    left_join(promo_dec, by=c("customer","sku")) %>%
+    left_join(sales_constants$customer_master %>% select(customer, value_for_money),
+              by="customer") %>%
+    mutate(
+      customer_type = ifelse(value_for_money, "value_for_money", "basic"),
+      promo_uplift = map_dbl(promotion_pressure, ~get_promo_uplift(.x, customer_type="basic")),
+      demand_units = demand_week_pieces * volume_factor * (1 + promo_uplift)
+    )
+  
+  # CI_promised lookup (Phase1: nếu join fail thì CI=1)
+  if (!is.null(decisions_sales$customer_product_level)) {
+    join_keys <- intersect(names(ci_sales_lookup), names(decisions_sales$customer_product_level))
+    ci_prom <- ci_sales_lookup %>%
+      left_join(decisions_sales$customer_product_level, by = join_keys) %>%
+      select(customer, sku, CI_promised = contractIndex)
+    dem <- dem %>% left_join(ci_prom, by=c("customer","sku"))
+  }
+  
+  dem %>%
+    mutate(CI_promised = ifelse(is.na(CI_promised), 1, CI_promised)) %>%
+    select(customer, sku, demand_units, CI_promised, promotion_pressure, volume_factor)
+}
+
+# ============================================================
+# 2) PRODUCTION PLAN (SC + PI-tool simplified)
+# planned_units = demand + target_SSFG - FG_stock
+# target_SSFG = safety_stock_weeks * demand_week
+# ignore PI/capacity here (Phase1)
+# ============================================================
+planning_week <- function(week, state, demand_w, decisions_sc, sc_constants, ops_constants) {
+  
+  fg_stock <- state$fg_stock %>%
+    select(sku, fg_units = units)
+  
+  ssfg_w <- decisions_sc$fg_safety_stock_w
+  if (is.null(ssfg_w)) {
+    ssfg_w <- setNames(rep(0, length(unique(demand_w$sku))), unique(demand_w$sku))
+  }
+  
+  plan <- demand_w %>%
+    group_by(sku) %>%
+    summarise(demand_units = sum(demand_units), .groups="drop") %>%
+    left_join(fg_stock, by="sku") %>%
+    mutate(
+      fg_units = ifelse(is.na(fg_units), 0, fg_units),
+      target_ss_units = ssfg_w[sku] * demand_units,
+      planned_units = pmax(0, demand_units + target_ss_units - fg_units)
+    )
+  
+  plan %>%
+    select(sku, demand_units, planned_units, target_ss_units)
+}
+
+# ============================================================
+# 3) RM REPLENISHMENT (SC + Purchasing simplified)
+# Compute RM need from planned_units * BOM
+# Reorder if RM_stock < SSRM_target
+# SSRM_target = ssrm_weeks * rm_week_need
+# Order qty = lot_size_weeks * rm_week_need (>=0)
+# Assume immediate receipt Phase1 (lead time ignored)
+# ============================================================
+rm_replenishment_week <- function(week, state, plan_w, decisions_sc, decisions_purch,
+                                  purchasing_constants, ci_purch_lookup, df_sku, df_component) {
+  
+  # RM usage per SKU from BOM
+  bom_long <- df_sku %>%
+    select(sku, starts_with("rm_")) %>%
+    tidyr::pivot_longer(starts_with("rm_"),
+                        names_to="component_raw", values_to="qty_per_unit") %>%
+    mutate(component = gsub("^rm_", "", component_raw)) %>%
+    select(sku, component, qty_per_unit)
+  
+  rm_need <- plan_w %>%
+    left_join(bom_long, by="sku") %>%
+    mutate(rm_week_need = planned_units * qty_per_unit) %>%
+    group_by(component) %>%
+    summarise(rm_week_need = sum(rm_week_need, na.rm=TRUE), .groups="drop")
+  
+  rm_stock <- state$rm_stock %>%
+    select(component, rm_units = units)
+  
+  ssrm_w <- decisions_sc$rm_safety_stock_w
+  if (is.null(ssrm_w)) {
+    ssrm_w <- setNames(rep(0, length(unique(rm_need$component))), unique(rm_need$component))
+  }
+  
+  lot_w <- decisions_sc$rm_lot_size_w
+  if (is.null(lot_w)) {
+    lot_w <- setNames(rep(1, length(unique(rm_need$component))), unique(rm_need$component))
+  }
+  
+  reorder_tbl <- rm_need %>%
+    left_join(rm_stock, by="component") %>%
+    mutate(
+      rm_units = ifelse(is.na(rm_units), 0, rm_units),
+      target_ss_units = ssrm_w[component] * rm_week_need,
+      lot_units = lot_w[component] * rm_week_need,
+      order_units = ifelse(rm_units < target_ss_units, lot_units, 0)
+    )
+  
+  # Purchase price via CI_purchase lookup (Phase1: CI=1 if fail)
+  # join theo keys có sẵn trong lookup
+  # decisions_purch$supplier_params phải có component + các biến CI
+  purchase_ci <- NULL
+  if (!is.null(decisions_purch$supplier_params)) {
+    join_keys <- intersect(names(ci_purch_lookup), names(decisions_purch$supplier_params))
+    purchase_ci <- ci_purch_lookup %>%
+      left_join(decisions_purch$supplier_params, by=join_keys) %>%
+      select(component, CI_purch = contractIndex)
+  }
+  
+  reorder_tbl <- reorder_tbl %>%
+    left_join(purchase_ci, by="component") %>%
+    left_join(df_component %>% select(component, basic_price), by="component") %>%
+    mutate(
+      CI_purch = ifelse(is.na(CI_purch), 1, CI_purch),
+      purchase_price = basic_price * CI_purch,
+      purchase_cost_total = order_units * purchase_price
+    )
+  
+  orders_w <- reorder_tbl %>%
+    filter(order_units > 0) %>%
+    transmute(
+      week, component,
+      order_qty_units = order_units,
+      purchase_price,
+      purchase_cost_total
+    )
+  
+  receipts_w <- orders_w %>%
+    transmute(week, component, received_qty_units = order_qty_units,
+              purchase_price)
+  
+  list(orders = orders_w, receipts = receipts_w, rm_need = rm_need)
+}
+
+# ============================================================
+# 4) EXECUTE PRODUCTION (Ops simplified)
+# If RM enough => produce planned_units else scale down proportionally
+# ignore labor/capacity/breakdown Phase1
+# ============================================================
+execute_production_week <- function(week, state, plan_w, rm_receipts_w,
+                                    decisions_ops, ops_constants) {
+  
+  # update RM stock temporarily to check availability
+  rm_stock_now <- state$rm_stock %>%
+    select(component, units) %>%
+    full_join(rm_receipts_w %>% select(component, received_qty_units),
+              by="component") %>%
+    mutate(received_qty_units = ifelse(is.na(received_qty_units), 0, received_qty_units),
+           units = ifelse(is.na(units), 0, units),
+           units_now = units + received_qty_units)
+  
+  # compute RM need for full plan
+  bom_long <- lookups$df_sku %>%
+    select(sku, starts_with("rm_")) %>%
+    tidyr::pivot_longer(starts_with("rm_"),
+                        names_to="component_raw", values_to="qty_per_unit") %>%
+    mutate(component = gsub("^rm_", "", component_raw)) %>%
+    select(sku, component, qty_per_unit)
+  
+  rm_need_full <- plan_w %>%
+    left_join(bom_long, by="sku") %>%
+    mutate(need = planned_units * qty_per_unit) %>%
+    group_by(component) %>%
+    summarise(need = sum(need, na.rm=TRUE), .groups="drop")
+  
+  rm_check <- rm_need_full %>%
+    left_join(rm_stock_now %>% select(component, units_now), by="component") %>%
+    mutate(units_now = ifelse(is.na(units_now), 0, units_now),
+           ratio = ifelse(need>0, pmin(1, units_now/need), 1))
+  
+  # bottleneck ratio = min across components
+  bottleneck_ratio <- min(rm_check$ratio, na.rm=TRUE)
+  if (!is.finite(bottleneck_ratio)) bottleneck_ratio <- 1
+  
+  produced <- plan_w %>%
+    mutate(
+      produced_units = planned_units * bottleneck_ratio,
+      outsourced_units = 0,
+      runtime_hours = NA_real_,
+      changeover_hours = NA_real_,
+      production_cost = 0
+    ) %>%
+    transmute(
+      week, sku,
+      planned_units, produced_units, outsourced_units,
+      runtime_hours, changeover_hours, production_cost,
+      utilization_rate = NA_real_
+    )
+  
+  # RM used per component
+  rm_used <- plan_w %>%
+    left_join(bom_long, by="sku") %>%
+    mutate(used_units = planned_units * bottleneck_ratio * qty_per_unit) %>%
+    group_by(component) %>%
+    summarise(used_units = sum(used_units, na.rm=TRUE), .groups="drop") %>%
+    mutate(week=week)
+  
+  fg_produced <- produced %>%
+    transmute(week, sku, produced_units)
+  
+  list(production = produced, rm_used = rm_used, fg_produced = fg_produced,
+       utilization_rate = NA_real_)
+}
+
+# ============================================================
+# 5) FULFILL DEMAND + SERVICE + PENALTY (Sales realized simplified)
+# ship = min(FG_stock + produced, demand)
+# penalty_factor approximated by comparing promised SL vs attained SL
+# Phase1: penalty_factor = 1
+# ============================================================
+fulfill_demand_week <- function(week, state, demand_w, fg_available,
+                                decisions_sales, sales_constants) {
+  
+  fg_stock <- state$fg_stock %>%
+    select(sku, fg_units = units)
+  
+  avail <- fg_stock %>%
+    full_join(fg_available %>% select(sku, produced_units), by="sku") %>%
+    mutate(fg_units = ifelse(is.na(fg_units), 0, fg_units),
+           produced_units = ifelse(is.na(produced_units), 0, produced_units),
+           available_units = fg_units + produced_units)
+  
+  exec <- demand_w %>%
+    left_join(avail %>% select(sku, available_units), by="sku") %>%
+    mutate(
+      available_units = ifelse(is.na(available_units), 0, available_units),
+      delivered_units = pmin(demand_units, available_units),
+      backorder_units = pmax(0, demand_units - available_units),
+      service_level_units = ifelse(demand_units>0, delivered_units/demand_units, 1),
+      penalty_factor = 1,               # Phase1 placeholder
+      attained_CI = CI_promised * penalty_factor
+    ) %>%
+    left_join(lookups$df_sku %>% select(sku, basic_sales_price), by="sku") %>%
+    mutate(
+      sales_price = basic_sales_price * attained_CI,
+      revenue = delivered_units * sales_price
+    )
+  
+  # distribution rows minimal (total pallets)
+  # pallets ~= delivered_units / units_per_pallet
+  exec <- exec %>%
+    left_join(lookups$df_sku %>% select(sku, units_per_pallet), by="sku") %>%
+    mutate(
+      pallets_shipped = ifelse(units_per_pallet>0, delivered_units/units_per_pallet, 0)
+    )
+  
+  exec$distribution_rows <- exec %>%
+    group_by(customer) %>%
+    summarise(
+      week=week,
+      distributor="DC Netherlands",
+      pallets_shipped=sum(pallets_shipped),
+      .groups="drop"
+    )
+  
+  exec %>%
+    transmute(
+      week, customer, sku,
+      demand_units, delivered_units, backorder_units,
+      service_level_units,
+      basic_sales_price, CI_promised, penalty_factor, attained_CI,
+      sales_price, revenue,
+      pallets_shipped
+    )
+}
+
+# ============================================================
+# 6) WAREHOUSING WEEK (Ops simplified)
+# Phase1: compute avg pallets stock using current state
+# ignore flex labor/overflow details
+# ============================================================
+warehousing_week <- function(week, state, rm_receipts_w, fg_shipments_w,
+                             decisions_ops, ops_constants) {
+  
+  rm_pallets <- state$rm_stock %>%
+    left_join(lookups$df_component %>% select(component, pallet_qty), by="component") %>%
+    mutate(pallet_qty = ifelse(is.na(pallet_qty), 1, pallet_qty),
+           pallets = units / pallet_qty) %>%
+    summarise(avg_pallets_in_stock = sum(pallets, na.rm=TRUE)) %>%
+    mutate(warehouse="RM", week=week)
+  
+  fg_pallets <- state$fg_stock %>%
+    left_join(lookups$df_sku %>% select(sku, units_per_pallet), by="sku") %>%
+    mutate(units_per_pallet = ifelse(is.na(units_per_pallet), 1, units_per_pallet),
+           pallets = units / units_per_pallet) %>%
+    summarise(avg_pallets_in_stock = sum(pallets, na.rm=TRUE)) %>%
+    mutate(warehouse="FG", week=week)
+  
+  bind_rows(rm_pallets, fg_pallets) %>%
+    mutate(
+      overflow_pallets = 0,
+      overflow_cost = 0,
+      handling_cost = 0,
+      labor_hours_perm = 0,
+      labor_hours_flex = 0
+    )
+}
+
+# ============================================================
+# 7) UPDATE STATE after each week - Phase1
+# ============================================================
+update_state_week <- function(state, rm_receipts_w, rm_used_w, fg_produced_w, fg_shipped_w) {
+  
+  # RM stock update
+  rm_stock <- state$rm_stock %>%
+    full_join(rm_receipts_w %>%
+                group_by(component) %>%
+                summarise(received=sum(received_qty_units), .groups="drop"),
+              by="component") %>%
+    full_join(rm_used_w %>%
+                group_by(component) %>%
+                summarise(used=sum(used_units), .groups="drop"),
+              by="component") %>%
+    mutate(
+      units = ifelse(is.na(units), 0, units),
+      received = ifelse(is.na(received), 0, received),
+      used = ifelse(is.na(used), 0, used),
+      units = pmax(0, units + received - used)
+    ) %>%
+    select(component, units)
+  
+  # FG stock update
+  fg_stock <- state$fg_stock %>%
+    full_join(fg_produced_w %>%
+                group_by(sku) %>%
+                summarise(produced=sum(produced_units), .groups="drop"),
+              by="sku") %>%
+    full_join(fg_shipped_w %>%
+                group_by(sku) %>%
+                summarise(shipped=sum(delivered_units), .groups="drop"),
+              by="sku") %>%
+    mutate(
+      units = ifelse(is.na(units), 0, units),
+      produced = ifelse(is.na(produced), 0, produced),
+      shipped = ifelse(is.na(shipped), 0, shipped),
+      units = pmax(0, units + produced - shipped),
+      age_w = ifelse(is.na(age_w), 0, age_w + 1) # ageing placeholder
+    ) %>%
+    select(sku, units, age_w)
+  
+  # inventory snapshot for flows
+  inventory_snapshot <- bind_rows(
+    rm_stock %>% transmute(item_type="RM", item=component, avg_stock_units=units),
+    fg_stock %>% transmute(item_type="FG", item=sku, avg_stock_units=units)
+  )
+  
+  state$rm_stock <- rm_stock
+  state$fg_stock <- fg_stock
+  state$inventory_snapshot <- inventory_snapshot
+  state
+}
+
+# ============================================================
+# 8) FINANCE AGGREGATE ROUND - Phase1
+# ROI = operating_profit / investment_total
+# investment_total rough: building + avg inventories
+# ============================================================
+finance_aggregate_round <- function(flows, finance_constants, ops_constants) {
+  
+  revenue <- sum(flows$sales$revenue, na.rm=TRUE)
+  
+  purchase_costs <- sum(flows$purchasing$purchase_cost_total, na.rm=TRUE)
+  production_costs <- sum(flows$production$production_cost, na.rm=TRUE)
+  
+  cogs <- purchase_costs + production_costs
+  
+  gross_margin <- revenue - cogs
+  
+  distribution_costs <- 0
+  if (nrow(flows$distribution) > 0) {
+    distribution_costs <- sum(
+      purrr::map_dbl(flows$distribution$pallets_shipped, ~{
+        calc_distribution_cost(.x, dc="DC Netherlands",
+                               finance_constants=finance_constants)$total_cost
+      }),
+      na.rm=TRUE
+    )
+  }
+  
+  handling_costs <- sum(flows$warehousing$handling_cost, na.rm=TRUE)
+  
+  operating_costs <- distribution_costs + handling_costs
+  
+  operating_profit <- gross_margin - operating_costs
+  
+  # investments (rough Phase1)
+  avg_rm_value <- mean(flows$inventory %>% filter(item_type=="RM") %>% pull(avg_stock_units), na.rm=TRUE)
+  avg_fg_value <- mean(flows$inventory %>% filter(item_type=="FG") %>% pull(avg_stock_units), na.rm=TRUE)
+  
+  investment_total <- finance_constants$investment$building_fixed +
+    ifelse(is.finite(avg_rm_value), avg_rm_value, 0) +
+    ifelse(is.finite(avg_fg_value), avg_fg_value, 0)
+  
+  ROI_pred <- ifelse(investment_total > 0, operating_profit / investment_total, NA_real_)
+  
+  list(
+    revenue = revenue,
+    purchase_costs = purchase_costs,
+    production_costs = production_costs,
+    cogs = cogs,
+    gross_margin = gross_margin,
+    distribution_costs = distribution_costs,
+    handling_costs = handling_costs,
+    operating_profit = operating_profit,
+    investment_total = investment_total,
+    ROI_pred = ROI_pred
+  )
+}
+lookups <- list(
+  df_sku = df_sku,
+  df_component = df_component,
+  CIpur_lookup = CIpur_lookup,
+  CIsale_lookup = CIsale_lookup
+)
+
+constants <- list(
+  sales = sales_constants,
+  purchasing = purchasing_constants,
+  supply_chain = sc_constants,
+  operations = operations_constants,
+  finance = finance_constants
+)
+
+state0_round <- list(
+  rm_stock = tibble(component = unique(df_component$component), units = 0),
+  fg_stock = tibble(sku = unique(df_sku$sku), units = 0, age_w=0),
+  backlog = tibble(),
+  inventory_snapshot = tibble()
+)
+
+decisions_round <- list(
+  sales = list(
+    customer_level = NULL,
+    customer_product_level = NULL
+  ),
+  purchasing = list(
+    supplier_params = NULL
+  ),
+  supply_chain = list(
+    rm_safety_stock_w = NULL,
+    rm_lot_size_w = NULL,
+    fg_safety_stock_w = NULL
+  ),
+  operations = list()
+)
+
+out <- engine_round(
+  state0 = state0_round,
+  decisions = decisions_round,
+  constants = constants,
+  lookups = lookups,
+  exogenous = list(volume_factor = tibble(customer=unique(df_sku$sku), volume_factor=1)),
+  n_weeks = 26
+)
+
+out$finance_round$ROI_pred
+
