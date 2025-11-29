@@ -1,5 +1,3 @@
-str(CIsale_lookup)
-str(CIpur_lookup)
 library(writexl)
 library(tibble)
 library(openxlsx)
@@ -20,7 +18,8 @@ sales_area_cp <- read_excel("sale_area_cp.xlsx") %>% clean_names()
 df_sku        <- read_excel("df_sku.xlsx")        %>% clean_names()
 CIpur_lookup  <- read_excel("CIpurlookup.xlsx")
 CIsale_lookup <- read_excel("CIsalelookup.xlsx")
-
+str(CIsale_lookup)
+str(CIpur_lookup)
 # =========================
 # 1) NORMALIZE LOOKUPS
 # =========================
@@ -67,15 +66,14 @@ CIsale_lookup <- CIsale_lookup %>%
 
 # ---- (1B) Purchasing CI lookup normalize ----
 CIpur_lookup <- CIpur_lookup %>%
-  janitor::clean_names() %>%
   rename(
-    quality              = quality,
-    delivery_window      = delivery_window,
-    delivery_reliability = delivery_reliability,
-    trade_unit           = trade_unit,
-    payment_term         = payment_term,
-    vendor_lookup        = vendor,
-    ci_purch             = contract_index
+    quality              = Quality,
+    delivery_window      = DeliveryWindow,
+    delivery_reliability = DeliveryReliability,
+    trade_unit           = Tradeunit,
+    payment_term         = Paymentterm,
+    vendor_lookup        = Vendor,
+    ci_purch             = ContractIndex
   ) %>%
   mutate(
     # chuẩn hoá chữ thường cho text fields
@@ -294,62 +292,73 @@ get_promo_uplift <- function(pressure){
 # =========================
 # 4) DECISIONS: BUILD SALES & PURCH PARAMS DEFAULT
 # =========================
+# =========================
+# 4) DECISIONS DEFAULT (SALES + PURCHASING)
+# =========================
 
-# ---- sales decision default (không cần sku để lookup CI) ----
+# ---- sales decision default ----
 make_sales_decisions <- function(customers, skus){
   expand_grid(customer=customers, sku=skus) %>%
     mutate(
       promotional_pressure="middle",
       order_deadline="14pm",
-      service_level=95,              # %
+      service_level=95,           # numeric
       trade_unit="box",
-      payment_term="4",                # weeks
+      payment_term="4",           # character
       promotion_horizon="short",
-      shelf_life="40"                  # %
+      shelf_life="50"             # <-- để match lookup thì dùng 50/65/80; Phase1 ok
     )
 }
 
 sales_decision_cp <- make_sales_decisions(
   customers = unique(customer_master$customer),
   skus      = unique(df_sku$sku)
-)%>%
+) %>%
   mutate(
     promotional_pressure = str_to_lower(promotional_pressure),
     trade_unit           = str_to_lower(trade_unit),
     promotion_horizon    = str_to_lower(promotion_horizon),
     order_deadline       = str_replace_all(order_deadline, "\\s+",""),
-    payment_term         = as.character(payment_term)
+    payment_term         = as.character(payment_term),
+    shelf_life           = as.character(shelf_life),
+    service_level        = as.numeric(service_level)
   )
 
-# lookup CI theo đúng key của lookup (không join sku!)
+# lookup CI sales theo key chuẩn (không join sku!)
 sales_ci_key <- c("customer","promotional_pressure","order_deadline","service_level",
                   "trade_unit","payment_term","promotion_horizon","shelf_life")
 
 sales_decision_cp <- sales_decision_cp %>%
   left_join(CIsale_lookup, by=sales_ci_key) %>%
-  mutate(ci_promised=ifelse(is.na(ci_promised),1,ci_promised))
+  mutate(ci_promised = replace_na(ci_promised, 1))
+
 
 # ---- purchasing supplier_params default ----
-# Phase 1: nếu bạn chưa fill chất lượng / reliability, pick 1 baseline.
-# Bạn có thể thay bằng decision thật sau.
+# Phase 1 bạn chưa scrape decision purchasing param => set baseline
 supplier_params_default <- tibble(
   component = c("Pack","PET","Orange","Mango","Vitamin C"),
-  vendor    = c("Mono Packaging Materials","Trio PET PLC","Miami Oranges","NO8DO Mango","Seitan Vitamins"),
-  quality   = "standard",
-  delivery_window = "standard",
-  delivery_reliability = "standard",
+  vendor    = c("Mono Packaging Materials","Trio PET PLC","Miami Oranges",
+                "NO8DO Mango","Seitan Vitamins"),
+  quality   = "high",
+  delivery_window = "1day",
+  delivery_reliability = 95,    # numeric (match lookup!)
   trade_unit = "pallet",
-  payment_term = "at delivery"
-)
+  payment_term = "4"
+) %>%
+  mutate(
+    quality = str_to_lower(quality),
+    delivery_window = str_to_lower(delivery_window),
+    trade_unit = str_to_lower(trade_unit),
+    payment_term = as.character(payment_term),
+    delivery_reliability = as.numeric(delivery_reliability)
+  )
 
-# lookup CI purchasing
-pur_ci_key <- c("quality","delivery_window","delivery_reliability","trade_unit",
-                "payment_term","vendor")
+pur_ci_key <- c("vendor","quality","delivery_window","delivery_reliability",
+                "trade_unit","payment_term")
 
 supplier_params_default <- supplier_params_default %>%
   left_join(CIpur_lookup, by=pur_ci_key) %>%
-  mutate(ci_purch=ifelse(is.na(ci_purch),1,ci_purch))
-
+  mutate(ci_purch = replace_na(ci_purch, 1))
 # =========================
 # 5) PHASE 1 FUNCTIONS
 # =========================
@@ -478,6 +487,7 @@ fulfill_demand_week <- function(week, state, demand_w, produced_w, df_sku){
   sales_exec <- demand_w %>%
     left_join(avail, by="sku") %>%
     mutate(
+      available_units = replace_na(available_units, 0),#
       delivered_units=pmin(demand_units,available_units),
       backorder_units=pmax(0,demand_units-available_units),
       attained_ci=ci_promised,
@@ -487,7 +497,8 @@ fulfill_demand_week <- function(week, state, demand_w, produced_w, df_sku){
     mutate(
       sales_price = basic_sales_price * attained_ci,
       revenue = delivered_units * sales_price,
-      pallets_shipped = delivered_units / units_per_pallet
+      pallets_shipped = delivered_units / units_per_pallet,
+      week = week 
     ) %>%
     select(week, customer, sku, demand_units, delivered_units,
            backorder_units, sales_price, revenue, pallets_shipped)
@@ -546,7 +557,7 @@ finance_aggregate_round <- function(flows, finance_constants){
        revenue=revenue, gross_margin=gross_margin,
        operating_profit=operating_profit, distribution_costs=dist_costs)
 }
-
+options(error = rlang::entrace)
 # =========================
 # 6) ENGINE ROUND (PHASE 1)
 # =========================
@@ -659,7 +670,7 @@ out <- engine_round(
 )
 
 out$finance_round$ROI_pred
-
+rlang::last_trace(drop = FALSE)
 unique(CIsale_lookup$promotional_pressure)
 unique(CIsale_lookup$order_deadline)
 unique(CIsale_lookup$trade_unit)
