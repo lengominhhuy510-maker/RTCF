@@ -267,21 +267,48 @@ finance_constants <- list(
 # =========================
 
 calc_distribution_cost <- function(pallets_shipped, dc="DC Netherlands", finance_constants){
-  base <- finance_constants$distribution$base_cost_per_pallet %>%
-    filter(dc==!!dc) %>% pull(base_cost)
-  tier <- finance_constants$distribution$provider_tiers %>%
-    filter(pallets_shipped>=pallet_min, pallets_shipped<=pallet_max) %>% slice(1)
+  
+  # nếu pallets_shipped NA/Inf -> báo để biết data bẩn
+  if (length(pallets_shipped)==0 || is.na(pallets_shipped) || !is.finite(pallets_shipped)){
+    warning("pallets_shipped invalid (NA/Inf). Set distribution cost = 0 for this row.")
+    return(0)
+  }
+  
+  # nếu =0 hoặc âm -> không ship => cost 0
+  if (pallets_shipped <= 0){
+    return(0)
+  }
+  
+  base_tbl <- finance_constants$distribution$base_cost_per_pallet
+  tier_tbl <- finance_constants$distribution$provider_tiers
+  
+  base <- base_tbl %>%
+    dplyr::filter(dc == !!dc) %>%
+    dplyr::pull(base_cost)
+  
+  if (length(base)==0 || is.na(base)){
+    warning(paste0("No base_cost found for dc=", dc, ". Using base_cost=0."))
+    base <- 0
+  }
+  
+  tier <- tier_tbl %>%
+    dplyr::filter(pallets_shipped >= pallet_min,
+                  pallets_shipped <= pallet_max) %>%
+    dplyr::slice(1)
+  
+  if (nrow(tier)==0){
+    warning(paste0("No tier matched pallets_shipped=", pallets_shipped,
+                   ". Using only base_cost."))
+    return(pallets_shipped * base)
+  }
+  
   cost_per_pallet <- base + tier$rate_per_pallet
   pallets_shipped * cost_per_pallet
 }
 
-make_empty_flows <- function(){
-  list(
-    sales=tibble(), production=tibble(), purchasing=tibble(),
-    inventory=tibble(), warehousing=tibble(), distribution=tibble()
-  )
-}
-
+df_sku %>%
+  filter(is.na(units_per_pallet) | units_per_pallet <= 0) %>%
+  select(sku, units_per_pallet)#check
 # promo uplift midpoint
 get_promo_uplift <- function(pressure){
   tab <- sales_constants$promotion_uplift$basic
@@ -495,15 +522,16 @@ fulfill_demand_week <- function(week, state, demand_w, produced_w, df_sku){
     ) %>%
     left_join(df_sku %>% select(sku, basic_sales_price, units_per_pallet), by="sku") %>%
     mutate(
+      units_per_pallet = ifelse(is.na(units_per_pallet) | units_per_pallet <= 0, NA, units_per_pallet),
       sales_price = basic_sales_price * attained_ci,
       revenue = delivered_units * sales_price,
-      pallets_shipped = delivered_units / units_per_pallet,
+      pallets_shipped = ifelse(is.na(units_per_pallet), 0, delivered_units / units_per_pallet),
       week = week 
     ) %>%
     select(week, customer, sku, demand_units, delivered_units,
            backorder_units, sales_price, revenue, pallets_shipped)
   
-  sales_exec
+  return(sales_exec)
 }
 
 update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_exec){
@@ -670,6 +698,12 @@ out <- engine_round(
 )
 
 out$finance_round$ROI_pred
+out$finance_round
+sum(out$flows$sales$revenue, na.rm=TRUE)
+sum(out$flows$purchasing$purchase_cost_total, na.rm=TRUE)
+sum(out$flows$sales$pallets_shipped, na.rm=TRUE)
+summary(sales_constants$observed$benchmark_demand$demand_week_pieces)
+head(out$flows$sales)
 rlang::last_trace(drop = FALSE)
 unique(CIsale_lookup$promotional_pressure)
 unique(CIsale_lookup$order_deadline)
