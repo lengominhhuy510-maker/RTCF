@@ -20,6 +20,7 @@ CIpur_lookup  <- read_excel("CIpurlookup.xlsx")
 CIsale_lookup <- read_excel("CIsalelookup.xlsx")
 str(CIsale_lookup)
 str(CIpur_lookup)
+
 # =========================
 # 1) NORMALIZE LOOKUPS
 # =========================
@@ -35,6 +36,16 @@ norm_customer <- function(x){
     TRUE ~ x1
   )
 }
+norm_component <- function(x){##Beta 0.0.3 
+  x %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("\\s+","_") %>%  # space -> _
+    stringr::str_squish()
+}
+df_sku <- df_sku %>%##beta 0.0.2
+  mutate(sku = str_squish(sku))
+df_component <- df_component %>%
+  mutate(component = norm_component(component)) ##beta 0.0.3
 # ---- (1A) Sales CI lookup normalize ----
 CIsale_lookup <- CIsale_lookup %>%
   clean_names() %>% 
@@ -102,13 +113,12 @@ CIpur_lookup <- CIpur_lookup %>%
   ) %>%
   select(vendor, quality, delivery_window, delivery_reliability,
          trade_unit, payment_term, ci_purch)
-
 # =========================
 # 2) CONSTANTS (giữ nguyên của bạn)
 # =========================
 
 operations_constants <- list(
-  mixer = list(
+  mixer = list(###
     technical_min_liters = 8000,
     max_capacity_liters  = 12000,
     operating_time_hours = 2.0,
@@ -227,7 +237,8 @@ sales_area_cp <- sales_area_cp %>%
     gross_margin_per_w=gross_margin_per_week_6
   )%>%
   mutate(
-    customer = norm_customer(customer)
+    customer = norm_customer(customer),
+    sku = stringr::str_squish(sku)   ##beta 0.0.2
   )
 
 benchmark_demand <- sales_area_cp %>% select(customer, sku, demand_week_pieces)
@@ -359,7 +370,7 @@ make_sales_decisions <- function(customers, skus){
 
 sales_decision_cp <- make_sales_decisions(
   customers = unique(customer_master$customer),
-  skus      = unique(df_sku$sku)
+  skus      = unique(benchmark_demand$sku)##beta 0.0.2
 ) %>%
   mutate(
     customer             = norm_customer(customer),   #
@@ -399,7 +410,8 @@ supplier_params_default <- tibble(
     payment_term = as.character(payment_term),
     delivery_reliability = as.numeric(delivery_reliability)
   )
-
+supplier_params_default <- supplier_params_default %>%
+  mutate(component = norm_component(component))##beta 0.0.3
 pur_ci_key <- c("vendor","quality","delivery_window","delivery_reliability",
                 "trade_unit","payment_term")
 
@@ -439,7 +451,7 @@ planning_week <- function(week, state, demand_w, decisions_sc){
   fg_stock <- state$fg_stock %>% select(sku, fg_units=units)
   
   ssfg_w <- decisions_sc$fg_safety_stock_w
-  if (is.null(ssfg_w)) ssfg_w <- setNames(rep(0,length(unique(demand_w$sku))), unique(demand_w$sku))
+  if (is.null(ssfg_w)){ ssfg_w <- setNames(rep(0,length(unique(demand_w$sku))), unique(demand_w$sku))}
   
   demand_sku <- demand_w %>% group_by(sku) %>% summarise(demand_units=sum(demand_units),.groups="drop")
   
@@ -447,7 +459,11 @@ planning_week <- function(week, state, demand_w, decisions_sc){
     left_join(fg_stock, by="sku") %>%
     mutate(
       fg_units=replace_na(fg_units,0),
-      target_ss_units = ssfg_w[sku] * demand_units,
+      #beta 0.0.2
+      ss_factor = ssfg_w[sku],
+      ss_factor = replace_na(ss_factor, 0),
+      target_ss_units = ss_factor * demand_units,
+      #----
       planned_units = pmax(0, demand_units + target_ss_units - fg_units)
     ) %>% select(sku, demand_units, planned_units)
   
@@ -457,10 +473,27 @@ planning_week <- function(week, state, demand_w, decisions_sc){
 rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
                                   supplier_params, df_sku, df_component){
   bom_long <- df_sku %>%
+    ##BETA 0.0.4
     select(sku, starts_with("rm_")) %>%
-    pivot_longer(starts_with("rm_"),
-                 names_to="component_raw", values_to="qty_per_unit") %>%
-    mutate(component = str_replace(component_raw,"rm_","")) %>%
+    pivot_longer(
+      cols = starts_with("rm_"),
+      names_to = "component_raw",
+      values_to = "qty_per_unit"
+    ) %>%
+    mutate(
+      component = str_replace(component_raw, "^rm_", ""),
+      qty_per_unit = replace_na(as.numeric(qty_per_unit), 0),  # NA -> 0, ép numeric luôn
+      
+      # map tên cho khớp df_component sau norm
+      component = dplyr::case_when(
+        component == "pack1liter" ~ "pack",
+        component == "vitaminc"   ~ "vitamin_c",
+        TRUE ~ component
+      ),
+      
+      # cuối cùng mới normalize format
+      component = norm_component(component)
+    ) %>%
     select(sku, component, qty_per_unit)
   
   rm_need <- plan_w %>%
@@ -504,16 +537,57 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
 }
 
 execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku){
-  produced <- plan_w %>%
-    mutate(produced_units=planned_units) %>%
-    transmute(week, sku, planned_units, produced_units, production_cost=0)
-  
+  ##patch update after have roi beta 0.0.1
+  ##beta 0.0.4
+  # bom
   bom_long <- df_sku %>%
     select(sku, starts_with("rm_")) %>%
-    pivot_longer(starts_with("rm_"),
-                 names_to="component_raw", values_to="qty_per_unit") %>%
-    mutate(component=str_replace(component_raw,"rm_","")) %>%
+    pivot_longer(
+      cols = starts_with("rm_"),
+      names_to = "component_raw",
+      values_to = "qty_per_unit"
+    ) %>%
+    mutate(
+      component = str_replace(component_raw, "^rm_", ""),
+      qty_per_unit = replace_na(as.numeric(qty_per_unit), 0),  # NA -> 0, ép numeric luôn
+      # map tên cho khớp df_component sau norm
+      component = dplyr::case_when(
+        component == "pack1liter" ~ "pack",
+        component == "vitaminc"   ~ "vitamin_c",
+        TRUE ~ component
+      ),
+      # cuối cùng mới normalize format
+      component = norm_component(component)
+    ) %>%
     select(sku, component, qty_per_unit)
+  
+  # RM available
+  rm_avail <- state$rm_stock %>%
+    left_join(
+      rm_receipts_w %>% group_by(component) %>%
+        summarise(received=sum(received_qty_units), .groups="drop"),
+      by="component"
+    ) %>%
+    mutate(received=replace_na(received,0),
+           avail_units = units + received) %>%
+    select(component, avail_units)
+  
+  # RM needed for plan
+  rm_need_for_plan <- plan_w %>%
+    left_join(bom_long, by="sku") %>%
+    mutate(need_units = planned_units * qty_per_unit) %>%
+    group_by(component) %>%
+    summarise(need_units=sum(need_units, na.rm=TRUE), .groups="drop") %>%
+    left_join(rm_avail, by="component") %>%
+    mutate(avail_units=replace_na(avail_units,0))
+  
+  # ratio possible
+  ratio <- min(rm_need_for_plan$avail_units / rm_need_for_plan$need_units, na.rm=TRUE)
+  ratio <- ifelse(is.finite(ratio), pmin(1, ratio), 0)
+  
+  produced <- plan_w %>%
+    mutate(produced_units = planned_units * ratio) %>%
+    transmute(week, sku, planned_units, produced_units, production_cost=0)
   
   rm_used <- produced %>%
     left_join(bom_long, by="sku") %>%
@@ -591,23 +665,34 @@ update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_ex
   state
 }
 
-finance_aggregate_round <- function(flows, finance_constants){
+finance_aggregate_round <- function(flows, finance_constants, operations_constants){ #fix patch beta 0.0.1
   revenue <- sum(flows$sales$revenue, na.rm=TRUE)
   purchase_costs <- sum(flows$purchasing$purchase_cost_total, na.rm=TRUE)
   cogs <- purchase_costs
   gross_margin <- revenue - cogs
   
-  dist_costs <- sum(map_dbl(flows$sales$pallets_shipped,
-                            ~calc_distribution_cost(.x, finance_constants=finance_constants)),
-                    na.rm=TRUE)
+  dist_costs <- sum(purrr::map_dbl(
+    flows$sales$pallets_shipped,
+    ~calc_distribution_cost(.x, finance_constants=finance_constants)
+  ), na.rm=TRUE)
   
   operating_profit <- gross_margin - dist_costs
-  investment_total <- finance_constants$investment$building_fixed
+  
+  # Gom CAPEX lại
+  investment_total <- finance_constants$investment$building_fixed +
+    operations_constants$mixer$investment_cost +
+    operations_constants$bottling_line$investment_cost %||% 0
+  
   ROI_pred <- operating_profit / investment_total
   
-  list(ROI_pred=ROI_pred,
-       revenue=revenue, gross_margin=gross_margin,
-       operating_profit=operating_profit, distribution_costs=dist_costs)
+  list(
+    ROI_pred=ROI_pred,
+    revenue=revenue,
+    gross_margin=gross_margin,
+    operating_profit=operating_profit,
+    distribution_costs=dist_costs,
+    investment_total=investment_total
+  )
 }
 options(error = rlang::entrace)
 # =========================
@@ -666,15 +751,22 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
     flows$purchasing  <- bind_rows(flows$purchasing, rm_rep$orders)
   }
   
-  finance_round <- finance_aggregate_round(flows, constants$finance)
-  
+  finance_round <- finance_aggregate_round(flows = flows, 
+                                           finance_constants = constants$finance,
+                                           operations_constants = constants$operations)#update beta 0.0.1
   list(flows=flows, finance_round=finance_round, state_end=state)
 }
 
 # =========================
 # 7) STATE0 + DECISIONS ROUND (PHASE 1 DEFAULT)
 # =========================
+##beta 0.0.3
+rm_ss  <- c(Pack=2, PET=3, Orange=2, Mango=2, `Vitamin C`=2.5)
+rm_lot <- c(Pack=4, PET=4, Orange=4, Mango=4, `Vitamin C`=4)
 
+names(rm_ss)  <- norm_component(names(rm_ss))
+names(rm_lot) <- norm_component(names(rm_lot))
+#----------
 state0_round <- list(
   rm_stock = tibble(component = unique(df_component$component), units=0),
   fg_stock = tibble(sku = unique(df_sku$sku), units=0, age_w=0)
@@ -688,8 +780,8 @@ decisions_round <- list(
     supplier_params = supplier_params_default
   ),
   supply_chain = list(
-    rm_safety_stock_w = c(Pack=2, PET=3, Orange=2, Mango=2, `Vitamin C`=2.5),
-    rm_lot_size_w     = c(Pack=4, PET=4, Orange=4, Mango=4, `Vitamin C`=4),
+    rm_safety_stock_w = rm_ss,##beta 0.0.3
+    rm_lot_size_w     = rm_lot,##beta 0.0.3
     fg_safety_stock_w = setNames(rep(3,length(unique(df_sku$sku))), unique(df_sku$sku))
   ),
   operations = list()
@@ -712,7 +804,7 @@ exo <- list(
 )
 
 # =========================
-# 8) RUN PHASE 1
+# 8) RUN PHASE 1 (free running cost)
 # =========================
 out <- engine_round(
   state0 = state0_round,
@@ -730,8 +822,23 @@ sum(out$flows$purchasing$purchase_cost_total, na.rm=TRUE)
 sum(out$flows$sales$pallets_shipped, na.rm=TRUE)
 summary(sales_constants$observed$benchmark_demand$demand_week_pieces)
 head(out$flows$sales)
+##fixing function
+tail(out$flows$sales, 10)
 rlang::last_trace(drop = FALSE)
 unique(CIsale_lookup$promotional_pressure)
 unique(CIsale_lookup$order_deadline)
 unique(CIsale_lookup$trade_unit)
 unique(CIsale_lookup$promotion_horizon)
+nrow(out$flows$sales)
+head(out$flows$sales, 10)
+summary(out$flows$sales$revenue)
+summary(out$flows$sales$demand_units)##not =0
+summary(out$flows$sales$delivered_units)
+
+names(df_sku)
+grep("^rm_", names(df_sku), value=TRUE)
+bom_long <- df_sku %>%
+  select(sku, starts_with("rm_")) %>%
+  pivot_longer(starts_with("rm_"),
+               names_to="component_raw", values_to="qty_per_unit") %>%
+  mutate(component = str_replace(component_raw,"rm_",""))

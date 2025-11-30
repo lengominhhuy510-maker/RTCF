@@ -573,6 +573,9 @@ constants <- list(
 )
 ##
 unique(CIsale_lookup$Customer) 
+unique(CIpur_lookup$Vendor)
+colnames(CIsale_lookup)
+colnames(CIpur_lookup)
 make_sales_decisions <- function(customers, skus){
   expand.grid(
     customer = customers,
