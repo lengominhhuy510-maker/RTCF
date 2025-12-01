@@ -1,15 +1,3 @@
-library(writexl)
-library(tibble)
-library(openxlsx)
-library(readxl)
-library(highcharter)
-library(dplyr)
-library(data.table)
-library(DT)
-library(tidyverse)
-library(purrr)
-library(tibble)
-library(janitor)
 # =========================
 # 0) LOAD DATA
 # =========================
@@ -128,13 +116,19 @@ operations_constants <- list(
     investment_cost        = 312500.00
   ),
   bottling_line = list(
+    line_type = "Swiss Fill 2",
+    capacity_lph = 3100,                 # <<< Swiss Fill 2 capacity
+    n_operators = 5,                     # <<< Swiss Fill 2 operators
+    operator_cost_per_year = 40000,      # <<< per operator
+    fixed_annual_cost = 98000,           # <<< Swiss Fill 2 fixed cost
     hours_per_shift = 40,
     shift_hours = c(`1`=40,`2`=80,`3`=120,`4`=144,`5`=168),
     operator_cost_per_year = 40000,
     operator_hours_per_week = 40,
-    formula_changeover_hours = NULL,
-    size_changeover_hours    = NULL,
-    startup_loss_hours = 1,
+    formula_changeover_hours = 2.0,##
+    size_changeover_hours    = 4.0,##
+    startup_loss_hours = 0.1,
+    investment_cost = 490000,             # <<< Swiss Fill 2 investment
     base_breakdown_rate = NULL,
     breakdown_hours_loss = NULL,
     packaging_quality_sensitivity = NULL
@@ -347,6 +341,46 @@ make_empty_flows <- function(){
     distribution= tibble()
   )
 }
+#Inventory holding + spoilage
+inventory_snapshot_week <- function(week, state, lookups, decisions, constants){
+  
+  df_component <- lookups$df_component
+  df_sku <- lookups$df_sku
+  supplier_params <- decisions$purchasing$supplier_params
+  interest_rate <- constants$purchasing$interest_rate
+  
+  # RM value (basic_price * ci_purch)
+  rm_val_tbl <- state$rm_stock %>%
+    left_join(df_component %>% select(component, basic_price), by="component") %>%
+    left_join(supplier_params %>% select(component, ci_purch), by="component") %>%
+    mutate(
+      basic_price = replace_na(basic_price, 0),
+      ci_purch = replace_na(ci_purch, 1),
+      rm_value = units * basic_price * ci_purch
+    )
+  
+  rm_value_total <- sum(rm_val_tbl$rm_value, na.rm=TRUE)
+  rm_holding_cost <- rm_value_total * interest_rate / 52
+  
+  # FG value (basic_sales_price)
+  fg_val_tbl <- state$fg_stock %>%
+    left_join(df_sku %>% select(sku, basic_sales_price), by="sku") %>%
+    mutate(
+      basic_sales_price = replace_na(basic_sales_price, 0),
+      fg_value = units * basic_sales_price
+    )
+  
+  fg_value_total <- sum(fg_val_tbl$fg_value, na.rm=TRUE)
+  fg_holding_cost <- fg_value_total * interest_rate / 52
+  
+  tibble(
+    week = week,
+    rm_value_total = rm_value_total,
+    fg_value_total = fg_value_total,
+    rm_holding_cost = rm_holding_cost,
+    fg_holding_cost = fg_holding_cost
+  )
+}
 # =========================
 # 4) DECISIONS: BUILD SALES & PURCH PARAMS DEFAULT
 # =========================
@@ -471,9 +505,10 @@ planning_week <- function(week, state, demand_w, decisions_sc){
 }
 
 rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
-                                  supplier_params, df_sku, df_component){
+                                  supplier_params, df_sku, df_component,
+                                  purchasing_constants){
+  
   bom_long <- df_sku %>%
-    ##BETA 0.0.4
     select(sku, starts_with("rm_")) %>%
     pivot_longer(
       cols = starts_with("rm_"),
@@ -482,16 +517,12 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
     ) %>%
     mutate(
       component = str_replace(component_raw, "^rm_", ""),
-      qty_per_unit = replace_na(as.numeric(qty_per_unit), 0),  # NA -> 0, ép numeric luôn
-      
-      # map tên cho khớp df_component sau norm
-      component = dplyr::case_when(
+      qty_per_unit = replace_na(as.numeric(qty_per_unit), 0),
+      component = case_when(
         component == "pack1liter" ~ "pack",
         component == "vitaminc"   ~ "vitamin_c",
         TRUE ~ component
       ),
-      
-      # cuối cùng mới normalize format
       component = norm_component(component)
     ) %>%
     select(sku, component, qty_per_unit)
@@ -506,7 +537,6 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
   
   ssrm_w <- decisions_sc$rm_safety_stock_w
   lot_w  <- decisions_sc$rm_lot_size_w
-  
   if (is.null(ssrm_w)) ssrm_w <- setNames(rep(0,nrow(rm_need)), rm_need$component)
   if (is.null(lot_w))  lot_w  <- setNames(rep(1,nrow(rm_need)), rm_need$component)
   
@@ -519,24 +549,58 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
       order_units = ifelse(rm_units < target_ss_units, lot_units, 0)
     ) %>%
     left_join(df_component %>% select(component, basic_price), by="component") %>%
-    left_join(supplier_params %>% select(component, ci_purch), by="component") %>%
+    left_join(supplier_params %>% select(component, ci_purch, vendor), by="component") %>%
     mutate(
+      basic_price = replace_na(basic_price, 0),
       ci_purch=replace_na(ci_purch,1),
       purchase_price = basic_price * ci_purch,
       purchase_cost_total = order_units * purchase_price
     )
   
+  # lead time
+  sup_master <- purchasing_constants$supplier_master %>%
+    rename(vendor = supplier) %>%
+    mutate(vendor = as.character(vendor))
+  
+  reorder_tbl <- reorder_tbl %>%
+    mutate(vendor = as.character(vendor)) %>%
+    left_join(sup_master %>% select(vendor, lead_time_days), by="vendor") %>%
+    mutate(
+      lead_time_days = replace_na(lead_time_days, 0),
+      lead_time_w = pmax(1, ceiling(lead_time_days / 5))
+    )
+  
+  # orders (cost now)
   orders <- reorder_tbl %>%
-    filter(order_units>0) %>%
-    transmute(week, component, order_qty_units=order_units,
-              purchase_price, purchase_cost_total)
+    filter(order_units > 0) %>%
+    transmute(
+      week,
+      component,
+      vendor,
+      order_qty_units = order_units,
+      purchase_price,
+      purchase_cost_total
+    )
   
-  receipts <- orders %>% transmute(week, component, received_qty_units=order_qty_units)
+  # receipts pipeline
+  receipts_w <- orders %>%
+    left_join(reorder_tbl %>% select(component, vendor, lead_time_w),
+              by=c("component","vendor")) %>%
+    transmute(
+      week_order = week,
+      component,
+      vendor,
+      order_qty_units,
+      purchase_price,
+      purchase_cost_total,
+      eta_week = week + lead_time_w
+    )
   
-  list(orders=orders, receipts=receipts)
+  list(orders = orders, receipts_w = receipts_w)
 }
 
-execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku){
+execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,
+                                    operations_constants, decisions_ops){
   ##patch update after have roi beta 0.0.1
   ##beta 0.0.4
   # bom
@@ -561,7 +625,7 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku){
     ) %>%
     select(sku, component, qty_per_unit)
   
-  # RM available
+  # RM available (end stock + receipts eta tuần này)
   rm_avail <- state$rm_stock %>%
     left_join(
       rm_receipts_w %>% group_by(component) %>%
@@ -579,16 +643,52 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku){
     group_by(component) %>%
     summarise(need_units=sum(need_units, na.rm=TRUE), .groups="drop") %>%
     left_join(rm_avail, by="component") %>%
-    mutate(avail_units=replace_na(avail_units,0))
+    mutate(avail_units=replace_na(avail_units,0),
+           need_units = replace_na(need_units,0))
   
   # ratio possible
-  ratio <- min(rm_need_for_plan$avail_units / rm_need_for_plan$need_units, na.rm=TRUE)
-  ratio <- ifelse(is.finite(ratio), pmin(1, ratio), 0)
+  ratio_rm <- min(rm_need_for_plan$avail_units / rm_need_for_plan$need_units, na.rm=TRUE)
+  ratio_rm <- ifelse(is.finite(ratio_rm), pmin(1, ratio_rm), 0) ##update phase 2
+  plan_after_rm <- plan_w %>%##update phase 2.1
+    mutate(planned_units_rm = planned_units * ratio_rm) 
   
-  produced <- plan_w %>%
-    mutate(produced_units = planned_units * ratio) %>%
-    transmute(week, sku, planned_units, produced_units, production_cost=0)
+  #Capacity constraint (Mixer)/outsource Update phase 2
+  liters_req <- plan_after_rm %>%
+    left_join(df_sku %>% select(sku, liters_per_pack), by="sku") %>%
+    mutate(liters_per_pack = replace_na(liters_per_pack, 0),
+           liters_required = planned_units_rm * liters_per_pack)
+  # bottling rate (liters per hour) - bạn set 1 con số hợp lý
+  bottling_rate_lph <- operations_constants$bottling_line$capacity_lph
+  if (is.null(bottling_rate_lph) || bottling_rate_lph <= 0) bottling_rate_lph <- 3100  # swiss Fill 2
+  hours_required <- sum(liters_req$liters_required, na.rm=TRUE) / bottling_rate_lph
+  # startup loss 10% => cần thêm giờ tương ứng
+  startup_loss_pct <- operations_constants$bottling_line$startup_loss_pct %||% 0.10
+  hours_required <- hours_required / (1 - startup_loss_pct)
+  # shifts decision
+  num_shifts <- decisions_ops$num_shifts %||% 1
+  shift_hours_tbl <- operations_constants$bottling_line$shift_hours
+  available_hours <- shift_hours_tbl[as.character(num_shifts)]
+  available_hours <- ifelse(is.na(available_hours), 40, available_hours)
   
+  internal_hours  <- pmin(hours_required, available_hours)
+  outsourced_hours <- pmax(0, hours_required - available_hours)
+  
+  outsource_pct <- ifelse(hours_required > 0, outsourced_hours / hours_required, 0)
+  # split units by outsource %
+  produced <- plan_after_rm %>%
+    mutate(
+      produced_units = planned_units_rm * (1 - outsource_pct),
+      outsourced_units = planned_units_rm * outsource_pct
+    ) %>%
+    transmute(
+      week, sku,
+      planned_units,
+      planned_units_rm,
+      produced_units,
+      outsourced_units
+    )
+  
+  # ---------- 4) RM used from REAL produced ----------
   rm_used <- produced %>%
     left_join(bom_long, by="sku") %>%
     mutate(used_units = produced_units * qty_per_unit) %>%
@@ -596,7 +696,32 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku){
     summarise(used_units=sum(used_units,na.rm=TRUE),.groups="drop") %>%
     mutate(week=week)
   
-  list(production=produced, rm_used=rm_used)
+  # ---------- 5) Production cost ----------
+  op_const <- operations_constants$bottling_line
+  labor_const <- operations_constants$labor_production
+  operator_cost_per_hour_one <- op_const$operator_cost_per_year / (52 * op_const$operator_hours_per_week)
+  operator_cost_per_hour_line <- operator_cost_per_hour_one * op_const$n_operators  # <<< nhân 5 operators
+  overtime_cost_per_hour <- labor_const$flex_cost_per_hour
+  outsource_cost_per_hour <- overtime_cost_per_hour * labor_const$outsourcing_factor  # 2x
+  
+  internal_cost  <- internal_hours  * operator_cost_per_hour_line
+  outsource_cost <- outsourced_hours * outsource_cost_per_hour
+  # cộng thêm fixed annual cost phân bổ theo tuần
+  fixed_week_cost <- op_const$fixed_annual_cost / 52
+  
+  production_cost_total <- internal_cost + outsource_cost + fixed_week_cost
+  
+  production_kpis <- tibble(
+    week=week,
+    hours_required=hours_required,
+    available_hours=available_hours,
+    internal_hours=internal_hours,
+    outsourced_hours=outsourced_hours,
+    outsourced_pct=outsource_pct,
+    production_cost_total=production_cost_total
+  )
+  
+  list(production=produced, rm_used=rm_used, kpis=production_kpis)
 }
 
 fulfill_demand_week <- function(week, state, demand_w, produced_w, df_sku){
@@ -624,15 +749,17 @@ fulfill_demand_week <- function(week, state, demand_w, produced_w, df_sku){
       sales_price = basic_sales_price * attained_ci,
       revenue = delivered_units * sales_price,
       pallets_shipped = ifelse(is.na(units_per_pallet), 0, delivered_units / units_per_pallet),
+      penalty_rate = 0.2,  # bạn có thể đổi
+      penalty_cost = backorder_units * basic_sales_price * penalty_rate,
       week = week 
     ) %>%
     select(week, customer, sku, demand_units, delivered_units,
-           backorder_units, sales_price, revenue, pallets_shipped)
+           backorder_units, sales_price, revenue, pallets_shipped, penalty_cost)
   
   return(sales_exec)
 }
 
-update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_exec){
+update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_exec, df_sku){
   # RM
   rm_stock <- state$rm_stock %>%
     full_join(receipts_w %>% group_by(component) %>% summarise(received=sum(received_qty_units),.groups="drop"),
@@ -646,7 +773,7 @@ update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_ex
       units=pmax(0,units+received-used)
     ) %>% select(component, units)
   
-  # FG
+  # FG #update phase 2
   fg_stock <- state$fg_stock %>%
     full_join(produced_w %>% group_by(sku) %>% summarise(produced=sum(produced_units),.groups="drop"),
               by="sku") %>%
@@ -657,8 +784,20 @@ update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_ex
       produced=replace_na(produced,0),
       shipped=replace_na(shipped,0),
       units=pmax(0,units+produced-shipped),
-      age_w=replace_na(age_w,0)+1
-    ) %>% select(sku, units, age_w)
+      age_w=ifelse(units > 0, replace_na(age_w, 0) + 1, 0)
+    ) %>% left_join(
+      df_sku %>% select(sku, shelf_life_w),
+      by="sku"
+    ) %>%
+    mutate(
+      shelf_life_w = replace_na(shelf_life_w, Inf),
+      
+      # nếu quá shelf life thì obsolete
+      obsolete_units = ifelse(age_w > shelf_life_w, units, 0),
+      units          = ifelse(age_w > shelf_life_w, 0, units),
+      age_w          = ifelse(age_w > shelf_life_w, 0, age_w)
+    ) %>%
+    select(sku, units, age_w, obsolete_units)
   
   state$rm_stock <- rm_stock
   state$fg_stock <- fg_stock
@@ -668,7 +807,12 @@ update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_ex
 finance_aggregate_round <- function(flows, finance_constants, operations_constants){ #fix patch beta 0.0.1
   revenue <- sum(flows$sales$revenue, na.rm=TRUE)
   purchase_costs <- sum(flows$purchasing$purchase_cost_total, na.rm=TRUE)
-  cogs <- purchase_costs
+  prod_costs <- sum(flows$production$production_cost, na.rm=TRUE)
+  
+  holding_costs <- sum(flows$inventory$rm_holding_cost, na.rm=TRUE) +
+    sum(flows$inventory$fg_holding_cost, na.rm=TRUE)
+  penalty_costs <- sum(flows$sales$penalty_cost, na.rm=TRUE)
+  cogs <- purchase_costs + prod_costs + holding_costs + penalty_costs
   gross_margin <- revenue - cogs
   
   dist_costs <- sum(purrr::map_dbl(
@@ -681,7 +825,7 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
   # Gom CAPEX lại
   investment_total <- finance_constants$investment$building_fixed +
     operations_constants$mixer$investment_cost +
-    operations_constants$bottling_line$investment_cost %||% 0
+    operations_constants$bottling_line$investment_cost
   
   ROI_pred <- operating_profit / investment_total
   
@@ -691,7 +835,12 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
     gross_margin=gross_margin,
     operating_profit=operating_profit,
     distribution_costs=dist_costs,
-    investment_total=investment_total
+    investment_total=investment_total,
+    cogs=cogs,
+    purchase_costs=purchase_costs,
+    production_costs=prod_costs,
+    holding_costs=holding_costs,
+    penalty_costs=penalty_costs
   )
 }
 options(error = rlang::entrace)
@@ -717,20 +866,37 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
       week=w, state=state, demand_w=demand_w,
       decisions_sc = decisions$supply_chain
     )
-    
+    ##phase 2 rm no receipt yet
     rm_rep <- rm_replenishment_week(
       week=w, state=state, plan_w=plan_w,
       decisions_sc = decisions$supply_chain,
       supplier_params = decisions$purchasing$supplier_params,
       df_sku = lookups$df_sku,
-      df_component = lookups$df_component
+      df_component = lookups$df_component,
+      purchasing_constants = constants$purchasing ##upadte phase 2
     )
+    ##update patch 0.0.5
+    if (nrow(rm_rep$receipts_w) > 0){
+      state$rm_pipeline <- bind_rows(state$rm_pipeline, rm_rep$receipts_w)
+    }
+    # receipts are those eta_week == w update phase 2
+    rm_receipts_w <- state$rm_pipeline %>%
+      filter(eta_week == w) %>%
+      transmute(week=w, component, received_qty_units=order_qty_units)##update phase 2
+    # keep future pipeline only update phase 2
+    state$rm_pipeline <- state$rm_pipeline %>%
+      filter(eta_week > w)
     
     prod_rep <- execute_production_week(
       week=w, state=state, plan_w=plan_w,
-      rm_receipts_w = rm_rep$receipts,
-      df_sku = lookups$df_sku
+      rm_receipts_w = rm_receipts_w,     # Phase 2 pipeline receipts
+      df_sku = lookups$df_sku,
+      operations_constants = constants$operations,
+      decisions_ops = decisions$operations
     )
+    
+    flows$production <- bind_rows(flows$production, prod_rep$production)
+    flows$operations <- bind_rows(flows$operations, prod_rep$kpis)
     
     sales_exec <- fulfill_demand_week(
       week=w, state=state, demand_w=demand_w,
@@ -739,18 +905,23 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
     )
     
     state <- update_state_week(
-      state, receipts_w=rm_rep$receipts,
+      state, receipts_w=rm_receipts_w,
       rm_used_w=prod_rep$rm_used,
       produced_w=prod_rep$production,
-      sales_exec=sales_exec
+      sales_exec=sales_exec,
+      df_sku = lookups$df_sku
     )
     
     # append flows
     flows$sales       <- bind_rows(flows$sales, sales_exec)
     flows$production  <- bind_rows(flows$production, prod_rep$production)
     flows$purchasing  <- bind_rows(flows$purchasing, rm_rep$orders)
+    # inventory snapshot for holding cost update phase 2
+    flows$inventory <- bind_rows(flows$inventory,
+                                 inventory_snapshot_week(w, state, lookups, decisions, constants)
+    )
   }
-  
+   
   finance_round <- finance_aggregate_round(flows = flows, 
                                            finance_constants = constants$finance,
                                            operations_constants = constants$operations)#update beta 0.0.1
@@ -769,7 +940,8 @@ names(rm_lot) <- norm_component(names(rm_lot))
 #----------
 state0_round <- list(
   rm_stock = tibble(component = unique(df_component$component), units=0),
-  fg_stock = tibble(sku = unique(df_sku$sku), units=0, age_w=0)
+  fg_stock = tibble(sku = unique(df_sku$sku), units=0, age_w=0),
+  rm_pipeline = tibble() #add phase 2
 )
 
 decisions_round <- list(
@@ -815,15 +987,8 @@ out <- engine_round(
   n_weeks = 26
 )
 # =========================
-# 9) RUN PHASE 2 (build refine)
+# 9) RUN PHASE 2 keep it real:))
 # =========================
-
-
-
-
-
-
-
 out$finance_round$ROI_pred
 out$finance_round
 sum(out$flows$sales$revenue, na.rm=TRUE)
@@ -831,29 +996,3 @@ sum(out$flows$purchasing$purchase_cost_total, na.rm=TRUE)
 sum(out$flows$sales$pallets_shipped, na.rm=TRUE)
 summary(sales_constants$observed$benchmark_demand$demand_week_pieces)
 head(out$flows$sales)
-##fixing & checking function
-out$flows$sales %>%
-  group_by(week) %>%
-  summarise(
-    delivered = sum(delivered_units, na.rm=TRUE),
-    revenue   = sum(revenue, na.rm=TRUE)
-  ) %>% ungroup() %>% 
-  filter(delivered > 0)
-summary(out$flows$sales$revenue)
-summary(out$flows$sales$demand_units)##not =0
-summary(out$flows$sales$delivered_units)
-tail(out$flows$sales, 10)
-unique(CIsale_lookup$promotional_pressure)
-unique(CIsale_lookup$order_deadline)
-unique(CIsale_lookup$trade_unit)
-unique(CIsale_lookup$promotion_horizon)
-nrow(out$flows$sales)
-head(out$flows$sales, 10)
-rlang::last_trace(drop = FALSE)
-names(df_sku)
-grep("^rm_", names(df_sku), value=TRUE)
-bom_long <- df_sku %>%
-  select(sku, starts_with("rm_")) %>%
-  pivot_longer(starts_with("rm_"),
-               names_to="component_raw", values_to="qty_per_unit") %>%
-  mutate(component = str_replace(component_raw,"rm_",""))
