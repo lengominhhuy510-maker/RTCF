@@ -814,11 +814,14 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
     )
   # FINAL RESCALE SAFETY (never over/under allocate) update beta 0.0.8
   sum_alloc <- sum(produced$production_cost, na.rm = TRUE)
-  
   if (is.finite(sum_alloc) && sum_alloc > 0) {
     produced <- produced %>%
       mutate(production_cost = production_cost * (production_cost_total / sum_alloc))
   }
+  # update 0.0.8 : idle cost handling -----
+  idle_cost <- ifelse(total_liters_week <= 0, production_cost_total, 0)
+  # nếu idle thì production_cost của SKU sẽ vẫn = 0 (đúng)
+  # cost không mất đi mà nằm ở idle_cost
   production_kpis <- tibble(
     week=week,
     ratio_rm=ratio_rm,
@@ -830,7 +833,8 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
     outsourced_pct=outsource_pct,
     mixer_hours_required=mixer_hours_required,
     mixer_hours_available=mixer_hours_available,
-    production_cost_total=production_cost_total
+    production_cost_total=production_cost_total,
+    idle_cost = idle_cost
   )
   list(production=produced, rm_used=rm_used, kpis=production_kpis)
 }
@@ -918,7 +922,9 @@ update_state_week <- function(state, receipts_w, rm_used_w, produced_w, sales_ex
 finance_aggregate_round <- function(flows, finance_constants, operations_constants){ #fix patch beta 0.0.1
   revenue <- sum(flows$sales$revenue, na.rm=TRUE)
   purchase_costs <- sum(flows$purchasing$purchase_cost_total, na.rm=TRUE)
-  prod_costs <- sum(flows$production$production_cost, na.rm=TRUE)
+  prod_costs_alloc <- sum(flows$production$production_cost, na.rm=TRUE)
+  prod_costs_idle  <- sum(flows$operations$idle_cost, na.rm=TRUE)#update beta 0.0.8
+  prod_costs <- prod_costs_alloc + prod_costs_idle   # update beta 0.0.8
   warehouse_costs <- sum(flows$warehousing$fg_location_cost, na.rm=TRUE) + ##update beta 0.0.7
     sum(flows$warehousing$fg_overflow_cost, na.rm=TRUE)
   scrap_costs <- sum(flows$warehousing$scrap_cost, na.rm=TRUE) ##update beta 0.0.7
@@ -956,7 +962,7 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
     admin_costs, #update beta 0.0.7
     cogs=cogs,
     purchase_costs=purchase_costs,
-    production_costs=prod_costs,
+    production_costs=prod_costs, #alloc + idle
     holding_costs=holding_costs,
     penalty_costs=penalty_costs
   )
@@ -1133,12 +1139,26 @@ out$flows$warehousing %>% summarise(sum_fg_cost=sum(fg_location_cost+fg_overflow
 ##check 
 chk_week2 <- out$flows$production %>%
   group_by(week) %>%
-  summarise(prod_cost=sum(production_cost), liters=sum(liters_required), .groups="drop") %>% print()
+  summarise(prod_cost=sum(production_cost),
+            liters=sum(liters_required),
+            .groups="drop") %>% print()
 
 kpi_week2 <- out$flows$operations %>%
-  transmute(week, kpi_cost=production_cost_total) %>% print()
+  transmute(week, kpi_cost=production_cost_total, idle_cost) %>% print()
 
 chk_week2 %>%
   left_join(kpi_week2, by="week") %>%
-  mutate(diff = prod_cost - kpi_cost) %>%
+  mutate(total_prod_cost = prod_cost + idle_cost,
+         diff = total_prod_cost - kpi_cost) %>%
   summarise(max_abs_diff = max(abs(diff)))
+sum(out$flows$operations$production_cost_total) -
+  (sum(out$flows$production$production_cost) + sum(out$flows$operations$idle_cost))
+##Sanity check 
+out$flows$sales %>% 
+  summarise(total_demand=sum(demand_units),
+            total_delivered=sum(delivered_units),
+            fill_rate=total_delivered/total_demand)##check why revenue is low rely on demand not fullfill by RM leadtime + safty stock?
+out$flows$production %>%
+  group_by(week) %>%
+  summarise(liters=sum(liters_required), prod=sum(produced_units)) %>%
+  filter(liters>0 | prod>0)
