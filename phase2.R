@@ -720,7 +720,20 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,
     outsourced_pct=outsource_pct,
     production_cost_total=production_cost_total
   )
+  # allocate production cost by liters share #update 0.0.6
+  liters_by_sku <- liters_req %>%
+    select(sku, liters_required)
   
+  total_liters <- sum(liters_by_sku$liters_required, na.rm=TRUE)
+  
+  produced <- produced %>%
+    left_join(liters_by_sku, by="sku") %>%
+    mutate(
+      liters_required = replace_na(liters_required,0),
+      production_cost = ifelse(total_liters > 0,
+                               production_cost_total * liters_required / total_liters,
+                               0)
+    )
   list(production=produced, rm_used=rm_used, kpis=production_kpis)
 }
 
@@ -996,3 +1009,8 @@ sum(out$flows$purchasing$purchase_cost_total, na.rm=TRUE)
 sum(out$flows$sales$pallets_shipped, na.rm=TRUE)
 summary(sales_constants$observed$benchmark_demand$demand_week_pieces)
 head(out$flows$sales)
+summary(out$flows$sales$demand_units)##not =0
+summary(out$flows$sales$delivered_units)
+##check 
+summary(df_sku$liters_per_pack)
+summary(df_sku$consumer_liters_per_pack)
