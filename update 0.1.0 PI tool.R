@@ -379,9 +379,9 @@ inventory_snapshot_week <- function(week, state, lookups, decisions, constants){
   tibble(
     week = week,
     rm_value_total = rm_value_total,
-    fg_value_total = fg_value_total,
+    fg_value_total = 0,##update 0.1.1 after add PI
     rm_holding_cost = rm_holding_cost,
-    fg_holding_cost = fg_holding_cost
+    fg_holding_cost = 0##update 0.1.1 after add PI
   )
 }
 ##update beta 0.0.7 FG warehouse cost + scrap cost
@@ -1199,8 +1199,11 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
     }
     # receipts are those eta_week == w update phase 2
     rm_receipts_w <- state$rm_pipeline %>%
-      filter(eta_week == w) %>%
-      transmute(week=w, component, received_qty_units=order_qty_units)##update phase 2
+      filter(eta_week == w) %>%left_join(decisions$purchasing$supplier_params %>%
+                                           select(component, delivery_reliability),
+                                         by="component") %>% #update beta 0.1.1
+      transmute(week=w, component, 
+                received_qty_units=order_qty_units*replace_na(delivery_reliability,100)/100) ##update beta 0.1.1
     # keep future pipeline only update phase 2
     state$rm_pipeline <- state$rm_pipeline %>%
       filter(eta_week > w)
