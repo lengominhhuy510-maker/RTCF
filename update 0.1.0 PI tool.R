@@ -340,7 +340,8 @@ make_empty_flows <- function(){
     purchasing_receipts = tibble(),# receipts
     inventory   = tibble(),
     warehousing = tibble(),
-    distribution= tibble()
+    distribution= tibble(),
+    pi = tibble() #update beta 0.1.0
   )
 }
 #Inventory holding + spoilage
@@ -505,6 +506,94 @@ allocate_shortage <- function(demand_tbl, rule=c("proportional","fcfs","priority
   
   demand_tbl
 }
+##PI helper update beta 0.1.0
+pi_tool_predict_week <- function(week, demand_w, decisions_sc, df_sku,
+                                 operations_constants, purchasing_constants,
+                                 decisions_ops, sc_constants){
+  
+  op_const <- operations_constants$bottling_line
+  cap_lph  <- op_const$capacity_lph
+  f_co_h   <- op_const$formula_changeover_hours
+  s_co_h   <- op_const$size_changeover_hours
+  su_h     <- op_const$startup_loss_hours
+  
+  operator_cost_per_hour_one  <- op_const$operator_cost_per_year / (52 * op_const$operator_hours_per_week)
+  cost_per_hour_line <- operator_cost_per_hour_one * op_const$n_operators
+  
+  interest_rate <- purchasing_constants$interest_rate
+  
+  # interval decision theo SKU (DAYS)
+  interval_d <- decisions_sc$fg_production_interval_d
+  if (is.null(interval_d)){
+    interval_d <- setNames(rep(5, length(unique(demand_w$sku))), unique(demand_w$sku)) # default 5 days
+  }
+  
+  # working days per week (game là 5)
+  wd_pw <- sc_constants$time$working_days_per_week %||% 5
+  
+  demand_sku <- demand_w %>%
+    group_by(sku) %>%
+    summarise(demand_week = sum(demand_units), .groups="drop") %>%
+    left_join(df_sku %>% select(sku, liters_per_pack, basic_sales_price),
+              by="sku") %>%
+    mutate(
+      interval_days = interval_d[sku] %>% replace_na(5),
+      
+      # clamp đúng boundary game
+      interval_days = pmin(25, pmax(1, interval_days)),
+      
+      # convert sang số tuần tương đương
+      k_weeks = interval_days / wd_pw,
+      
+      # lot Q theo interval
+      Q = demand_week * k_weeks,
+      liters = Q * liters_per_pack,
+      run_hours = ifelse(cap_lph>0, liters/cap_lph, 0),
+      
+      avg_inv_units = Q/2,
+      avg_inv_value = avg_inv_units * basic_sales_price,
+      
+      # PI tool hiển thị €/year
+      stock_cost_year = avg_inv_value * interest_rate
+    )
+  
+  n_sku_run <- sum(demand_sku$Q > 0, na.rm=TRUE)
+  n_co <- max(0, n_sku_run - 1)
+  
+  co_formula_hours <- n_co * f_co_h
+  co_size_hours    <- n_co * s_co_h
+  startup_hours    <- n_sku_run * su_h
+  
+  runtime_hours <- sum(demand_sku$run_hours, na.rm=TRUE)
+  stock_costs_year <- sum(demand_sku$stock_cost_year, na.rm=TRUE)
+  
+  startup_cost_year  <- startup_hours * cost_per_hour_line * 52
+  changeover_costs_year <- (co_formula_hours + co_size_hours) * cost_per_hour_line * 52
+  
+  total_time_hours <- runtime_hours + co_formula_hours + co_size_hours + startup_hours
+  
+  num_shifts <- decisions_ops$num_shifts %||% 1
+  available_hours <- op_const$shift_hours[as.character(num_shifts)]
+  available_hours <- ifelse(is.na(available_hours), 40, available_hours)
+  
+  utilization <- ifelse(available_hours>0, total_time_hours/available_hours, 0)
+  
+  tibble(
+    week = week,
+    stock_costs_year = stock_costs_year,
+    run_time_hours = runtime_hours,
+    startup_loss_cost_year = startup_cost_year,
+    changeover_formula_hours = co_formula_hours,
+    changeover_size_hours = co_size_hours,
+    changeover_costs_year = changeover_costs_year,
+    total_costs_year = stock_costs_year + startup_cost_year + changeover_costs_year,
+    total_time_hours = total_time_hours,
+    utilization_rate = utilization,
+    n_sku_run = n_sku_run,
+    n_changeover = n_co
+  )
+}
+
 # =========================
 # 4) DECISIONS: BUILD SALES & PURCH PARAMS DEFAULT
 # =========================
@@ -550,7 +639,7 @@ sales_decision_cp <- sales_decision_cp %>%
   mutate(ci_promised = replace_na(ci_promised, 1))
 
 # ---- purchasing supplier_params default ----
-# Phase 1 bạn chưa scrape decision purchasing param => set baseline
+# Phase 1  chưa scrape decision purchasing param => set baseline
 supplier_params_default <- tibble(
   component = c("Pack","PET","Orange","Mango","Vitamin C"),
   vendor    = c("Mono Packaging Materials","Trio PET PLC","Miami Oranges",
@@ -1021,8 +1110,12 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
     sum(flows$inventory$fg_holding_cost, na.rm=TRUE)
   penalty_costs <- sum(flows$sales$penalty_cost, na.rm=TRUE)
   admin_costs <- sum(flows$distribution$admin_cost, na.rm=TRUE)
+  pi_costs_week <- 0 ##Update beta 0.1.0
+  if (nrow(flows$pi) > 0){
+    pi_costs_week <- sum(flows$pi$total_costs_year / 52, na.rm=TRUE)
+  }
   cogs <- purchase_costs + prod_costs + holding_costs + penalty_costs+
-    warehouse_costs + scrap_costs + admin_costs
+    warehouse_costs + scrap_costs + admin_costs+ pi_costs_week
   gross_margin <- revenue - cogs
   
   dist_costs <- sum(purrr::map_dbl(
@@ -1049,6 +1142,7 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
     warehouse_costs=warehouse_costs,##update beta 0.0.7
     scrap_costs=scrap_costs,##update beta 0.0.7
     admin_costs, #update beta 0.0.7
+    pi_costs_week = pi_costs_week,  #update beta 0.1.0
     cogs=cogs,
     purchase_costs=purchase_costs,
     production_costs=prod_costs, #alloc + idle
@@ -1073,6 +1167,17 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
       sales_decision_cp = decisions$sales$customer_product_level,
       sales_constants = constants$sales,
       exo = exogenous
+    )
+    ##Add PI tool #update beta 0.1.0
+    pi_kpi_w <- pi_tool_predict_week(
+      week = w,
+      demand_w = demand_w,
+      decisions_sc = decisions$supply_chain,
+      df_sku = lookups$df_sku,
+      operations_constants = constants$operations,
+      purchasing_constants = constants$purchasing,
+      decisions_ops = decisions$operations,
+      sc_constants = constants$supply_chain   ##update beta 0.1.0
     )
     
     plan_w <- planning_week(
@@ -1136,6 +1241,7 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
       flows$distribution,
       admin_cost_week(w, rm_rep$orders, sales_exec, constants$purchasing)
     )
+    flows$pi <- bind_rows(flows$pi, pi_kpi_w) ##Update beta 0.1.0
     # inventory snapshot for holding cost update phase 2
     flows$inventory <- bind_rows(flows$inventory,
                                  inventory_snapshot_week(w, state, lookups, decisions, constants)
@@ -1179,7 +1285,9 @@ decisions_round <- list(
   supply_chain = list(
     rm_safety_stock_w = rm_ss,##beta 0.0.3
     rm_lot_size_w     = rm_lot,##beta 0.0.3
-    fg_safety_stock_w = setNames(rep(3,length(unique(df_sku$sku))), unique(df_sku$sku))
+    fg_safety_stock_w = setNames(rep(3,length(unique(df_sku$sku))), unique(df_sku$sku)),
+    ##Update beta 0.1.0 : interval in DAYS, bound [1;25]
+    fg_production_interval_d = setNames(rep(9, length(unique(df_sku$sku))), unique(df_sku$sku))
   ),
   operations = list()
 )
