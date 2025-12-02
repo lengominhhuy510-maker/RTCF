@@ -794,11 +794,13 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
       purchase_price,
       purchase_cost_total
     )
-  
+  ##Update beta 0.1.2 fix warning dup receipt
+  lead_tbl <- reorder_tbl %>%
+    group_by(component, vendor) %>%
+    summarise(lead_time_w = max(lead_time_w), .groups="drop")
   # receipts pipeline
   receipts_w <- orders %>%
-    left_join(reorder_tbl %>% select(component, vendor, lead_time_w),
-              by=c("component","vendor")) %>%
+    left_join(lead_tbl, by=c("component","vendor")) %>% ##Update beta 0.1.2 fix warning dup receipt
     transmute(
       week_order = week,
       component,
@@ -1367,3 +1369,50 @@ out$flows$production %>%
   group_by(week) %>%
   summarise(liters=sum(liters_required), prod=sum(produced_units)) %>%
   filter(liters>0 | prod>0)
+
+decisions_round <- decisions_round_base   # nếu bạn lưu baseline
+out0 <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+roi0 <- out0$finance_round$ROI_pred
+roi0
+test_knob <- function(label, modify_fn){
+  dec <- decisions_round_base
+  dec <- modify_fn(dec)
+  out <- engine_round(state0_round, dec, constants, lookups, exo, 26)
+  tibble(
+    knob = label,
+    ROI = out$finance_round$ROI_pred
+  )
+}
+
+res <- bind_rows(
+  test_knob("A_interval=1", function(dec){
+    dec$supply_chain$fg_production_interval_d[] <- 1; dec
+  }),
+  test_knob("B_SLA_Groceries97", function(dec){
+    cp <- dec$sales$customer_product_level %>%
+      mutate(service_level = ifelse(customer=="Food & Groceries",97,service_level)) %>%
+      left_join(CIsale_lookup, by=sales_ci_key) %>%
+      mutate(ci_promised=replace_na(ci_promised,1))
+    dec$sales$customer_product_level <- cp; dec
+  }),
+  test_knob("C_FG_SS=0.5", function(dec){
+    dec$supply_chain$fg_safety_stock_w[] <- 0.5; dec
+  })
+)
+
+res <- res %>% mutate(delta_vs_base = ROI - roi0)
+res
+dec_combo <- decisions_round_base
+# apply A
+dec_combo$supply_chain$fg_production_interval_d[] <- 1
+# apply B
+cp <- dec_combo$sales$customer_product_level %>%
+  mutate(service_level = ifelse(customer=="Food & Groceries",97,service_level)) %>%
+  left_join(CIsale_lookup, by=sales_ci_key) %>%
+  mutate(ci_promised=replace_na(ci_promised,1))
+dec_combo$sales$customer_product_level <- cp
+# apply C
+dec_combo$supply_chain$fg_safety_stock_w[] <- 0.5
+
+out_combo <- engine_round(state0_round, dec_combo, constants, lookups, exo, 26)
+out_combo$finance_round$ROI_pred
