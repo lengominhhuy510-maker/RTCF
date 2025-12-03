@@ -589,6 +589,159 @@ pi_tool_predict_week <- function(week, demand_w, decisions_sc, df_sku,plan_w,
     n_changeover = n_co
   )
 }
+##Update 0.1.6 Cate management
+auto_assortment_phase3 <- function(
+    benchmark_demand,
+    sales_exec_hist = NULL,
+    df_sku = NULL,
+    sales_decision_cp = NULL,
+    assortment_prior = NULL,
+    rules = list(
+      margin_min_per_unit = 0,        # <0 => margin âm
+      margin_fail_weeks = 4,          # margin âm >=4 tuần thì tắt
+      sla_fail_rate_max = 0.30,       # >30% tuần fail SLA thì tắt
+      slowmover_ratio = 0.20,         # demand <20% median customer demand => slow
+      min_weeks_obs = 4               # cần ít nhất 4 tuần history mới xét SLA/margin
+    )
+){
+  stopifnot(all(c("customer","sku","demand_week_pieces") %in% names(benchmark_demand)))
+  ##
+  benchmark_full <- tidyr::expand_grid(
+    customer = unique(customer_master$customer),
+    sku      = unique(df_sku$sku)
+  ) %>%
+    left_join(benchmark_demand, by=c("customer","sku")) %>%
+    mutate(demand_week_pieces = replace_na(demand_week_pieces, 0))
+  #0) base matrix from benchmark
+  base <- benchmark_full %>%
+    mutate(
+      customer = norm_customer(customer),
+      sku = stringr::str_squish(sku),
+      base_active = demand_week_pieces > 0
+    ) %>%
+    select(customer, sku, demand_week_pieces, base_active)
+  
+  # nếu không có history => trả baseline luôn
+  if (is.null(sales_exec_hist) || is.null(df_sku)) {
+    out <- base %>%
+      transmute(customer, sku, active = base_active)
+    
+    # apply prior override nếu có
+    if (!is.null(assortment_prior) && nrow(assortment_prior)>0){
+      out <- out %>%
+        left_join(assortment_prior %>% select(customer, sku, active_prior=active),
+                  by=c("customer","sku")) %>%
+        mutate(active = ifelse(!is.na(active_prior), active_prior, active)) %>%
+        select(customer, sku, active)
+    }
+    return(out)
+  }
+  
+  # 1) margin per unit from history 
+  # sales_exec_hist expected cols: week, customer, sku, demand_units, delivered_units, sales_price, revenue
+  hist <- sales_exec_hist %>%
+    mutate(
+      customer = norm_customer(customer),
+      sku = stringr::str_squish(sku)
+    ) %>%
+    left_join(df_sku %>% select(sku, basic_sales_price), by="sku") %>%
+    mutate(
+      basic_sales_price = replace_na(basic_sales_price, 0),
+      unit_margin = sales_price - basic_sales_price
+    )
+  
+  margin_stat <- hist %>%
+    group_by(customer, sku) %>%
+    summarise(
+      weeks_obs = n_distinct(week),
+      neg_margin_weeks = sum(unit_margin < rules$margin_min_per_unit, na.rm=TRUE),
+      avg_unit_margin = mean(unit_margin, na.rm=TRUE),
+      .groups="drop"
+    ) %>%
+    mutate(
+      margin_bad = weeks_obs >= rules$min_weeks_obs & 
+        neg_margin_weeks >= rules$margin_fail_weeks
+    )
+  
+  #2) SLA fail rate
+  # nếu có sales_decision_cp thì lấy service_level theo customer-sku
+  if (!is.null(sales_decision_cp) && "service_level" %in% names(sales_decision_cp)){
+    sl_tbl <- sales_decision_cp %>%
+      mutate(
+        customer = norm_customer(customer),
+        sku = stringr::str_squish(sku),
+        service_level = as.numeric(service_level)/100
+      ) %>%
+      select(customer, sku, service_level)
+  } else {
+    sl_tbl <- tibble(customer=character(), sku=character(), service_level=numeric())
+  }
+  
+  sla_stat <- hist %>%
+    left_join(sl_tbl, by=c("customer","sku")) %>%
+    mutate(
+      service_level = replace_na(service_level, 0.95),
+      fill_rate = ifelse(demand_units>0, delivered_units/demand_units, 1),
+      sla_fail = fill_rate < service_level
+    ) %>%
+    group_by(customer, sku) %>%
+    summarise(
+      weeks_obs = n_distinct(week),
+      sla_fail_rate = mean(sla_fail, na.rm=TRUE),
+      .groups="drop"
+    ) %>%
+    mutate(
+      sla_bad = weeks_obs >= rules$min_weeks_obs &
+        sla_fail_rate > rules$sla_fail_rate_max
+    )
+  
+  #3) Slow mover (demand thấp so với median của customer)
+  slow_stat <- base %>%
+    group_by(customer) %>%
+    mutate(
+      med_dem = median(demand_week_pieces[ base_active ], na.rm=TRUE),
+      slowmover = base_active & demand_week_pieces < rules$slowmover_ratio * med_dem
+    ) %>%
+    ungroup() %>%
+    select(customer, sku, slowmover)
+  
+  #4) combine rules
+  out <- base %>%
+    left_join(margin_stat, by=c("customer","sku")) %>%
+    left_join(sla_stat, by=c("customer","sku")) %>%
+    left_join(slow_stat, by=c("customer","sku")) %>%
+    mutate(
+      margin_bad = replace_na(margin_bad, FALSE),
+      sla_bad    = replace_na(sla_bad, FALSE),
+      slowmover  = replace_na(slowmover, FALSE),
+      
+      # active logic:
+      # - phải base_active trước
+      # - nếu bad theo margin hoặc SLA hoặc slowmover => tắt
+      active_auto = base_active & !(margin_bad | sla_bad | slowmover)
+    ) %>%
+    transmute(customer, sku, active = active_auto)
+  
+  #5) apply manual override if provided
+  if (!is.null(assortment_prior) && nrow(assortment_prior)>0){
+    out <- out %>%
+      left_join(
+        assortment_prior %>%
+          mutate(
+            customer = norm_customer(customer),
+            sku = stringr::str_squish(sku)
+          ) %>%
+          select(customer, sku, active_prior=active),
+        by=c("customer","sku")
+      ) %>%
+      mutate(
+        active = ifelse(!is.na(active_prior), active_prior, active)
+      ) %>%
+      select(customer, sku, active)
+  }
+  
+  out
+}
 
 # =========================
 # 4) DECISIONS: BUILD SALES & PURCH PARAMS DEFAULT
@@ -689,7 +842,7 @@ sales_demand_week <- function(week, state, sales_decision_cp, sales_constants, e
   if (!is.null(assortment_cp) && nrow(assortment_cp)>0){
     dem <- dem %>%
       left_join(assortment_cp, by=c("customer","sku")) %>%
-      mutate(active = replace_na(active, TRUE),
+      mutate(active = ifelse(is.na(active), TRUE, active),
              demand_units = ifelse(active, demand_units, 0))
   }
   
@@ -1282,6 +1435,18 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
     if (nrow(rm_rep$receipts_w) > 0){
       state$rm_pipeline <- bind_rows(state$rm_pipeline, rm_rep$receipts_w)
     }
+    # Update 0.1.7  more safty,make robust engine
+    if (is.null(state$rm_pipeline) || !("eta_week" %in% names(state$rm_pipeline))) {
+      state$rm_pipeline <- tibble(
+        week_order = integer(),
+        component  = character(),
+        vendor     = character(),
+        order_qty_units = double(),
+        purchase_price  = double(),
+        purchase_cost_total = double(),
+        eta_week   = integer()
+      )
+    }
     # receipts are those eta_week == w update phase 2
     rm_receipts_w <- state$rm_pipeline %>%
       filter(eta_week == w) %>%left_join(decisions$purchasing$supplier_params %>%
@@ -1394,9 +1559,9 @@ assortment_cp <- make_assortment_decisions(
 assortment_cp <- assortment_cp %>%
   mutate(active = case_when(
     customer == "Dominick's" & sku %in% c(
-      "Fressie Orange 1 liter",
-      "Fressie Orange/C-power 1 liter",
-      "Fressie Orange/Mango 1 liter"
+      "Fressie Orange PET",
+      "Fressie Orange/C-power PET",
+      "Fressie Orange/Mango PET"
     ) ~ FALSE,
     TRUE ~ TRUE
   ))
@@ -1408,7 +1573,15 @@ init_fg_next_prod <- tibble(
 state0_round <- list(
   rm_stock = tibble(component = unique(df_component$component), units=0),
   fg_stock = tibble(sku = unique(df_sku$sku), units=0, age_w=0),
-  rm_pipeline = tibble(), #add phase 2
+  rm_pipeline = tibble(##Update 0.1.7 init schema cho pipeline để init schema cho pipeline để
+    week_order = integer(),
+    component  = character(),
+    vendor     = character(),
+    order_qty_units = double(),
+    purchase_price  = double(),
+    purchase_cost_total = double(),
+    eta_week   = integer() 
+  ), #add phase 2
   fg_next_prod = init_fg_next_prod, ##Update beta 0.1.3
   prod_frozen_pipeline = tibble()   ##Update beta 0.1.5
 )
@@ -1469,6 +1642,43 @@ out <- engine_round(
 out$finance_round$ROI_pred
 out$finance_round
 
+# =========================
+# 9.1) Prepare phase 3 - AUTO CATEGORY MANAGEMENT 
+# =========================
+# chạy 1 vòng baseline để có sales history
+out_base <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+
+# auto assortment từ history vừa rồi
+assort_auto <- auto_assortment_phase3(
+  benchmark_demand = benchmark_demand,
+  sales_exec_hist  = out_base$flows$sales,
+  df_sku           = df_sku,
+  sales_decision_cp= sales_decision_cp,
+  assortment_prior = NULL, # nếu muốn override giữ lại
+  rules = list(
+    margin_min_per_unit = 0,
+    margin_fail_weeks   = 4,
+    sla_fail_rate_max   = 0.30,
+    slowmover_ratio     = 0.20,
+    min_weeks_obs       = 4
+  )
+)
+
+decisions_round$sales$assortment_cp <- assort_auto
+
+# chạy lại để xem effect
+out_auto <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+
+out_base$finance_round$ROI_pred
+out_auto$finance_round$ROI_pred
+
+assortment_cp %>% arrange(customer, sku)
+assort_auto    %>% arrange(customer, sku)
+
+anti_join(assortment_cp, assort_auto, by=c("customer","sku","active"))
+
+
+##
 sum(out$flows$sales$revenue, na.rm=TRUE)
 sum(out$flows$purchasing$purchase_cost_total, na.rm=TRUE)
 sum(out$flows$sales$pallets_shipped, na.rm=TRUE)

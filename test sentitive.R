@@ -39,23 +39,35 @@ outFG5$flows$operations$hours_required
 outFG0$flows$operations$hours_required
 
 #
-# baseline: active all
-decisions_round$sales$assortment_cp <- NULL
+
+# chạy 1 vòng baseline để có sales history
 out_base <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
 
-# scenario assort: tắt 3 SKU cho Dominick's
-decisions_round$sales$assortment_cp <- assortment_cp
-out_assort <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+# auto assortment từ history vừa rồi
+assort_auto <- auto_assortment_phase3(
+  benchmark_demand = benchmark_demand,
+  sales_exec_hist  = out_base$flows$sales,
+  df_sku           = df_sku,
+  sales_decision_cp= sales_decision_cp,
+  assortment_prior = NULL, # nếu muốn override giữ lại
+  rules = list(
+    margin_min_per_unit = 0,
+    margin_fail_weeks   = 4,
+    sla_fail_rate_max   = 0.30,
+    slowmover_ratio     = 0.20,
+    min_weeks_obs       = 4
+  )
+)
 
-out_base$flows$sales %>% summarise(rev=sum(revenue))
-out_assort$flows$sales %>% summarise(rev=sum(revenue))
+decisions_round$sales$assortment_cp <- assort_auto
 
-benchmark_demand %>%
-  filter(customer=="Dominick's",
-         sku %in% c("Fressie Orange 1 liter",
-                    "Fressie Orange/C-power 1 liter",
-                    "Fressie Orange/Mango 1 liter"))
+# chạy lại để xem effect
+out_auto <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
 
-benchmark_demand %>%
-  filter(customer == "Dominick's") %>%
-  distinct(sku)
+out_base$finance_round$ROI_pred
+out_auto$finance_round$ROI_pred
+
+assortment_cp %>% arrange(customer, sku)
+assort_auto    %>% arrange(customer, sku)
+
+anti_join(assortment_cp, assort_auto, by=c("customer","sku","active"))
