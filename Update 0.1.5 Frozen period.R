@@ -1512,3 +1512,11 @@ outA$flows$pi %>% summarise(
 outB$finance_round$ROI_pred
 outB$finance_round
 head(out$flows$pi)
+
+decisions_round$supply_chain$frozen_period_weeks <- 1
+out1 <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+out1$finance_round
+
+decisions_round$supply_chain$frozen_period_weeks <- 4
+out4 <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+out4$finance_round
