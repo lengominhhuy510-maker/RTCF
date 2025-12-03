@@ -1251,20 +1251,23 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
       decisions_ops = decisions$operations
     )
     
-    # PATCH 0.1.3: update next production week after running
-    if (!is.null(state$fg_next_prod) && nrow(prod_rep$production) > 0){
+    # PATCH 0.1.3: update next production week after running #Update logic 0.1.4 production based on plant
+    if (!is.null(state$fg_next_prod)) {
       
-      ran_skus <- prod_rep$production %>%
-        filter(produced_units > 0 | outsourced_units > 0) %>%
+      ran_skus <- plan_w %>%
+        filter(allowed_to_run, planned_units > 0) %>%
         distinct(sku)
       
-      if (nrow(ran_skus) > 0){
+      if (nrow(ran_skus) > 0) {
+        
         cad_tbl <- plan_w %>% select(sku, cadence_weeks)
         
         ran_skus <- ran_skus %>%
           left_join(cad_tbl, by="sku") %>%
-          mutate(cadence_weeks = replace_na(cadence_weeks, 1L),
-                 next_prod_week = w + cadence_weeks)
+          mutate(
+            cadence_weeks = replace_na(cadence_weeks, 1L),
+            next_prod_week = w + cadence_weeks
+          )
         
         state$fg_next_prod <- state$fg_next_prod %>%
           left_join(ran_skus %>% select(sku, next_prod_week), by="sku") %>%
@@ -1349,7 +1352,7 @@ decisions_round <- list(
     supplier_params = supplier_params_default
   ),
   supply_chain = list(
-    rm_safety_stock_w = rm_ss,##beta 0.0.3
+    rm_safety_stock_w = rm_ss ,##beta 0.0.3
     rm_lot_size_w     = rm_lot,##beta 0.0.3
     fg_safety_stock_w = setNames(rep(3,length(unique(df_sku$sku))), unique(df_sku$sku)),
     ##Update beta 0.1.0 : interval in DAYS, bound [1;25]
@@ -1435,7 +1438,7 @@ decisions_round$supply_chain$fg_production_interval_d[] <- 1
 
 out <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
 out$finance_round$ROI_pred
-
+##
 # baseline
 decisions_round$supply_chain$fg_production_interval_d[] <- 9
 outB <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
@@ -1457,4 +1460,6 @@ outA$flows$pi %>% summarise(
   changeover = mean(changeover_costs_year/52),
   total = mean(total_costs_year/52)
 )
+outB$finance_round$ROI_pred
+outB$finance_round
 head(out$flows$pi)
