@@ -12,7 +12,7 @@ outSS2$finance_round
 outSS5$finance_round
 mean(outSS2$flows$operations$ratio_rm)
 mean(outSS5$flows$operations$ratio_rm)
-#SC
+#RM size
 lo <- decisions_round
 lo$supply_chain$rm_lot_size_w[] <- 1
 outLot1 <- engine_round(state0_round, lo, constants, lookups, exo, 26)
@@ -24,6 +24,13 @@ outLot6 <- engine_round(state0_round, hi, constants, lookups, exo, 26)
 outLot1$finance_round
 outLot6$finance_round
 outLot1$flows$distribution$inbound_orders
+
+#frozen
+decisions_round$supply_chain$frozen_period_weeks <- 2
+out2 <-engine_round(state0_round, hi, constants, lookups, exo, 26)
+decisions_round$supply_chain$frozen_period_weeks <- 0
+out0 <- engine_round(state0_round, hi, constants, lookups, exo, 26)
+
 #FG
 lo <- decisions_round
 lo$supply_chain$fg_safety_stock_w[] <- 0
@@ -38,8 +45,7 @@ outFG5$finance_round
 outFG5$flows$operations$hours_required
 outFG0$flows$operations$hours_required
 
-#
-
+#sale
 # chạy 1 vòng baseline để có sales history
 out_base <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
 
@@ -71,3 +77,25 @@ assortment_cp %>% arrange(customer, sku)
 assort_auto    %>% arrange(customer, sku)
 
 anti_join(assortment_cp, assort_auto, by=c("customer","sku","active"))
+#. Option B
+margin_stat <- hist %>%
+  group_by(customer, sku) %>%
+  summarise(
+    weeks_obs = n_distinct(week),
+    neg_margin_weeks = sum(unit_margin < rules$margin_min_per_unit &
+                             delivered_units > 0, na.rm=TRUE),
+    avg_unit_margin = mean(unit_margin[delivered_units > 0], na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  mutate(
+    margin_bad = weeks_obs >= rules$min_weeks_obs & 
+      neg_margin_weeks >= rules$margin_fail_weeks
+  )
+
+#pallet location
+decisions_round$operations$fg_pallet_locations <- 500
+out_low <-engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+decisions_round$operations$fg_pallet_locations <- 300
+out_high <-engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
+out_low$finance_round
+out_high$finance_round
