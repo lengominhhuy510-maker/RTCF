@@ -400,6 +400,7 @@ fg_warehouse_week <- function(week, state, lookups, operations_constants,decisio
     )
   
   pallets_total <- sum(fg_tbl$pallets, na.rm=TRUE)
+  
   ##Update 0.1.6 : pallet capacity knob 
   pallet_capacity <- decisions_ops$fg_pallet_locations %||% 10
   
@@ -424,6 +425,113 @@ fg_warehouse_week <- function(week, state, lookups, operations_constants,decisio
     fg_location_cost=pallet_location_cost_week,
     fg_overflow_cost=overflow_cost_week,
     scrap_cost=scrap_cost_week
+  )
+}
+##Update 0.1.9 RM warehouse cost + labor + inspection 
+rm_warehouse_week <- function(week, state, lookups, operations_constants,
+                              decisions_ops, orders_w = tibble(), receipts_w = tibble(),
+                              sc_constants = NULL){
+  
+  rm_const <- operations_constants$rm_warehouse
+  insp_const <- operations_constants$raw_material_inspection %||% list(add_hours_per_orderline=0)
+  logi_const <- if (!is.null(sc_constants)) sc_constants$logistics else list()
+  
+  df_comp <- lookups$df_component
+  
+  #- pallets in RM stock (for overflow)
+  # try to use units_per_pallet if exists in df_component
+  if ("units_per_pallet" %in% names(df_comp)) {
+    rm_tbl <- state$rm_stock %>%
+      left_join(df_comp %>% select(component, units_per_pallet), by="component") %>%
+      mutate(
+        units_per_pallet = replace_na(units_per_pallet, NA_real_),
+        pallets = ifelse(is.na(units_per_pallet) | units_per_pallet <= 0, 0, units/units_per_pallet)
+      )
+    pallets_total <- sum(rm_tbl$pallets, na.rm = TRUE)
+  } else {
+    pallets_total <- 0
+    #không stop engine, nhưng note để bạn biết
+    warning("df_component has no units_per_pallet -> RM pallets_total set to 0 (overflow costs off).")
+  }
+  
+  #fixed capacity decision knob
+  rm_capacity <- decisions_ops$rm_pallet_locations %||% 10
+  overflow_pallets <- pmax(0, pallets_total - rm_capacity)
+  
+  rm_location_cost_week <- rm_capacity * rm_const$pallet_location_cost_year / 52
+  rm_overflow_cost_week <- overflow_pallets * rm_const$pallet_overflow_cost_week
+  
+  #-workload hours in RM warehouse 
+  inbound_orderlines <- nrow(orders_w)   # Phase 2: 1 line = 1 orderline
+  inbound_orders     <- n_distinct(orders_w$week) %||% 0
+  
+  # pallets received this week (if receipts_w has order_qty_units and units_per_pallet)
+  pallets_received <- 0
+  if (nrow(receipts_w) > 0 && "units_per_pallet" %in% names(df_comp)) {
+    pallets_received <- receipts_w %>%
+      left_join(df_comp %>% select(component, units_per_pallet), by="component") %>%
+      mutate(
+        units_per_pallet = replace_na(units_per_pallet, NA_real_),
+        pallets = ifelse(is.na(units_per_pallet) | units_per_pallet<=0, 0, received_qty_units/units_per_pallet)
+      ) %>%
+      summarise(pallets=sum(pallets, na.rm=TRUE)) %>%
+      pull(pallets)
+  }
+  
+  # trade_unit split for "make available" time
+  trade_unit_tbl <- orders_w %>%
+    select(component, trade_unit) %>%
+    mutate(trade_unit = str_to_lower(replace_na(trade_unit, "pallet"))) %>%
+    distinct()
+  
+  n_tank_deliv <- trade_unit_tbl %>% filter(trade_unit %in% c("tank","tanktruck")) %>% nrow()
+  n_pallet_like <- trade_unit_tbl %>% filter(trade_unit %in% c("pallet","ibc","drum")) %>% nrow()
+  
+  intake_hours <- inbound_orderlines * rm_const$intake_hours_per_orderline
+  intake_pallet_hours <- pallets_received * rm_const$intake_minutes_per_pallet / 60
+  
+  make_avail_hours <- 
+    pallets_received * rm_const$make_available_minutes_pallet / 60 +
+    n_tank_deliv * rm_const$make_available_minutes_tank / 60
+  
+  overflow_handle_hours <- overflow_pallets * rm_const$overflow_handling_minutes_per_pallet / 60
+  
+  ibc_fill_hours <- trade_unit_tbl %>%
+    filter(trade_unit == "ibc") %>%
+    nrow() * rm_const$ibc_filling_hours
+  
+  housekeeping_hours <- rm_const$weekly_housekeeping_hours
+  
+  #inspection knob (on/off)
+  inspection_on <- decisions_ops$rm_inspection_on %||% FALSE ##
+  inspection_hours <- if (inspection_on) inbound_orderlines * insp_const$add_hours_per_orderline else 0
+  
+  workload_hours <- intake_hours + intake_pallet_hours + make_avail_hours +
+    overflow_handle_hours + ibc_fill_hours + housekeeping_hours + inspection_hours
+  
+  #-labor cost (perm + flex, flex valued at perm hourly rate)
+  perm_rate <- rm_const$fte_cost_per_year / (52 * rm_const$fte_hours_per_week)
+  
+  n_fte_rm <- decisions_ops$n_fte_rm_wh %||% 1
+  perm_cap_hours <- n_fte_rm * rm_const$fte_hours_per_week
+  
+  perm_hours <- pmin(workload_hours, perm_cap_hours)
+  flex_hours <- pmax(0, workload_hours - perm_cap_hours)
+  
+  labor_cost_week <- (perm_hours + flex_hours) * perm_rate
+  
+  tibble(
+    week = week,
+    rm_pallets = pallets_total,
+    rm_overflow_pallets = overflow_pallets,
+    rm_location_cost = rm_location_cost_week,
+    rm_overflow_cost = rm_overflow_cost_week,
+    rm_workload_hours = workload_hours,
+    rm_perm_hours = perm_hours,
+    rm_flex_hours = flex_hours,
+    rm_labor_cost = labor_cost_week,
+    rm_inspection_hours = inspection_hours,
+    rm_inspection_on = inspection_on
   )
 }
 ##update helper admin beta 0.0.7
@@ -1349,7 +1457,10 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
   prod_costs_idle  <- sum(flows$operations$idle_cost, na.rm=TRUE)#update beta 0.0.8
   prod_costs <- prod_costs_alloc + prod_costs_idle   # update beta 0.0.8
   warehouse_costs <- sum(flows$warehousing$fg_location_cost, na.rm=TRUE) + ##update beta 0.0.7
-    sum(flows$warehousing$fg_overflow_cost, na.rm=TRUE)
+    sum(flows$warehousing$fg_overflow_cost, na.rm=TRUE)+
+    sum(flows$warehousing$rm_location_cost, na.rm=TRUE) +
+    sum(flows$warehousing$rm_overflow_cost, na.rm=TRUE) +
+    sum(flows$warehousing$rm_labor_cost, na.rm=TRUE)
   scrap_costs <- sum(flows$warehousing$scrap_cost, na.rm=TRUE) ##update beta 0.0.7
   holding_costs <- sum(flows$inventory$rm_holding_cost, na.rm=TRUE) +
     sum(flows$inventory$fg_holding_cost, na.rm=TRUE)
@@ -1583,6 +1694,20 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
     flows$warehousing <- bind_rows(
       flows$warehousing,
       fg_warehouse_week(w, state, lookups, constants$operations, decisions$operations)) ##Update 0.1.6
+    #Update 0.1.9 RM warehouse
+    flows$warehousing <- bind_rows(
+      flows$warehousing,
+      rm_warehouse_week(
+        week = w,
+        state = state,
+        lookups = lookups,
+        operations_constants = constants$operations,
+        decisions_ops = decisions$operations,
+        orders_w = rm_rep$orders,
+        receipts_w = rm_receipts_w,
+        sc_constants = constants$supply_chain
+      )
+    )
     # inventory snapshot for holding cost update phase 2
     flows$inventory <- bind_rows(flows$inventory,
                                  inventory_snapshot_week(w, state, lookups, decisions, constants)
@@ -1667,7 +1792,9 @@ decisions_round <- list(
     fg_pallet_locations = 1500,
     rm_pallet_locations = 900,
     num_shifts = 1,          ##Update 0.1.8
-    n_fte_bottling = 5       ##Update 0.1.8
+    n_fte_bottling = 5,      ##Update 0.1.8
+    n_fte_rm_wh = 3,        ##update 0.1.9
+    rm_inspection_on = FALSE  #On/off inspection
   )
 )
 
