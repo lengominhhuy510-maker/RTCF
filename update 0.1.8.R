@@ -102,7 +102,7 @@ CIpur_lookup <- CIpur_lookup %>%
   select(vendor, quality, delivery_window, delivery_reliability,
          trade_unit, payment_term, ci_purch)
 # =========================
-# 2) CONSTANTS (giữ nguyên của bạn)
+# 2) CONSTANTS 
 # =========================
 
 operations_constants <- list(
@@ -234,7 +234,9 @@ sales_area_cp <- sales_area_cp %>%
     customer = norm_customer(customer),
     sku = stringr::str_squish(sku)   ##beta 0.0.2
   )
-
+##Update 0.2.0
+sales_area_cp <- sales_area_cp %>%
+  mutate(demand_week_pieces = as.numeric(gsub("\\.", "", demand_week_pieces)))
 benchmark_demand <- sales_area_cp %>% select(customer, sku, demand_week_pieces)
 
 sales_constants <- list(
@@ -1740,7 +1742,7 @@ assortment_cp <- make_assortment_decisions(
   skus      = unique(benchmark_demand$sku)
 )
 
-# nếu muốn giống screen của bạn:
+# normal cate manage :
 assortment_cp <- assortment_cp %>%
   mutate(active = case_when(
     customer == "Dominick's" & sku %in% c(
