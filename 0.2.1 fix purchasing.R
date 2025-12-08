@@ -794,7 +794,7 @@ auto_assortment_phase3 <- function(
   stopifnot(all(c("customer","sku","demand_week_pieces") %in% names(benchmark_demand)))
   ##
   benchmark_full <- tidyr::expand_grid(
-    customer = unique(customer_master$customer),
+    customer = unique(benchmark_demand$customer),
     sku      = unique(df_sku$sku)
   ) %>%
     left_join(benchmark_demand, by=c("customer","sku")) %>%
@@ -906,10 +906,13 @@ auto_assortment_phase3 <- function(
   #4) combine rules
   #Update 0.2.3 contribution margin avg per unit from history
   cm_hist <- hist %>%
-    mutate(cm_unit = sales_price - basic_sales_price) %>%
+    mutate(cm_unit = sales_price - basic_sales_price,
+           cm_total = cm_unit * delivered_units) %>%
     group_by(customer, sku) %>%
     summarise(
-      cm_avg = mean(cm_unit[delivered_units > 0], na.rm=TRUE),
+      cm_unit_avg  = mean(cm_unit[delivered_units > 0], na.rm=TRUE),
+      cm_total_sum = sum(cm_total, na.rm=TRUE),
+      vol_sum      = sum(delivered_units, na.rm=TRUE),
       .groups="drop"
     )
   out <- base %>%
@@ -922,9 +925,15 @@ auto_assortment_phase3 <- function(
       margin_bad = replace_na(margin_bad, FALSE),
       sla_bad    = replace_na(sla_bad, FALSE),
       slowmover  = replace_na(slowmover, FALSE),
+      cm_total_sum = replace_na(cm_total_sum, -Inf),
+      vol_sum      = replace_na(vol_sum, 0),
+      # core chỉ xét SKU đủ volume/CM
+      eligible_core = vol_sum >= 1000 & cm_total_sum > 0,  #0.2.3tune ngưỡng
       #Tune rule: keep core SKUs #Update 0.2.1 floor rule
-      rank_cm = rank(-demand_week_pieces, ties.method="first"),
-      keep_core = rank_cm <= 2, # giữ top X SKU / customer
+      rank_core = rank(-ifelse(eligible_core, cm_total_sum, -Inf),
+                       ties.method="first"),
+      keep_core = rank_core <= 2, # giữ top X SKU / customer
+      keep_core = replace_na(keep_core, FALSE), ##Update 0.2.3 make more robust
       # active logic:
       # - phải base_active trước
       # - nếu bad theo margin hoặc SLA hoặc slowmover => tắt
@@ -967,7 +976,7 @@ refresh_ci_purch <- function(supplier_params, CIpur_lookup){
   pur_ci_key <- c("vendor","quality","delivery_window","delivery_reliability",
                   "trade_unit","payment_term")
   
-  supplier_params %>%
+  supplier_params_clean <- supplier_params %>%
     mutate(
       vendor = as.character(vendor),
       quality = str_to_lower(quality),
@@ -975,15 +984,19 @@ refresh_ci_purch <- function(supplier_params, CIpur_lookup){
       trade_unit = str_to_lower(trade_unit),
       payment_term = as.character(payment_term),
       delivery_reliability = as.numeric(delivery_reliability)
-    ) %>%
-    left_join(CIpur_lookup, by=pur_ci_key) %>%
+    ) 
+  #Update 0.2.3 nếu đã có ci_purch sẵn thì bỏ đi trước khi join để tránh .x/.y
+  if ("ci_purch" %in% names(supplier_params_clean)) {
+    supplier_params_clean <- supplier_params_clean %>% select(-ci_purch)
+  }
+  supplier_params_clean %>% left_join(CIpur_lookup, by=pur_ci_key) %>%
     mutate(ci_purch = replace_na(ci_purch, 1))
 }
 ##Update 0.2.1 Add refresh CI sale
 refresh_ci_sales <- function(sales_decision_cp, CIsale_lookup) {
   sales_ci_key <- c("customer","promotional_pressure","order_deadline","service_level",
                     "trade_unit","payment_term","promotion_horizon","shelf_life")
-  sales_decision_cp %>%
+  sales_decision_clean <-sales_decision_cp %>%
     mutate(
       customer             = norm_customer(customer),
       promotional_pressure = str_to_lower(promotional_pressure),
@@ -993,8 +1006,12 @@ refresh_ci_sales <- function(sales_decision_cp, CIsale_lookup) {
       payment_term         = as.character(payment_term),
       shelf_life           = as.character(shelf_life),
       service_level        = as.numeric(service_level)
-    ) %>%
-    left_join(CIsale_lookup, by = sales_ci_key) %>%
+    ) 
+  #Update 0.2.3 nếu đã có ci_promised sẵn thì bỏ đi trước khi join để tránh .x/.y
+  if ("ci_promised" %in% names(sales_decision_clean)) {
+    sales_decision_clean <- sales_decision_clean %>% select(-ci_promised)
+  }
+  sales_decision_clean %>% left_join(CIsale_lookup, by = sales_ci_key) %>%
     mutate(ci_promised = replace_na(ci_promised, 1))
 }
 # =========================
@@ -1661,7 +1678,22 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
   
   flows <- make_empty_flows()
   state <- state0
-  
+  ##Update 0.2.3 FIX CI REFRESH
+  #refresh purchasing CI every round in case optimizer changes params
+  if (!is.null(decisions$purchasing$supplier_params)) {
+    decisions$purchasing$supplier_params <- refresh_ci_purch(
+      decisions$purchasing$supplier_params,
+      lookups$CIpur_lookup %||% CIpur_lookup
+    )
+  }
+  # refresh sales CI every round in case optimizer changes agreements
+  if (!is.null(decisions$sales$customer_product_level)) {
+    decisions$sales$customer_product_level <- refresh_ci_sales(
+      decisions$sales$customer_product_level,
+      lookups$CIsale_lookup %||% CIsale_lookup
+    )
+  }
+  #--
   for (w in 1:n_weeks){
     
     demand_w <- sales_demand_week(
@@ -1947,7 +1979,8 @@ decisions_round <- list(
   )
 )
 
-lookups <- list(df_sku=df_sku, df_component=df_component)
+lookups <- list(df_sku=df_sku, df_component=df_component,
+                CIpur_lookup = CIpur_lookup,CIsale_lookup = CIsale_lookup)##update 0.2.3 for phase 3 sync by lookup instead of stale ci
 
 constants <- list(
   sales=sales_constants,
