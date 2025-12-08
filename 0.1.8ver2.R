@@ -762,12 +762,13 @@ auto_assortment_phase3 <- function(
       unit_margin = sales_price - basic_sales_price
     )
   
-  margin_stat <- hist %>%
+  margin_stat <- hist %>% ##update 0.1.9 
     group_by(customer, sku) %>%
     summarise(
       weeks_obs = n_distinct(week),
-      neg_margin_weeks = sum(unit_margin < rules$margin_min_per_unit, na.rm=TRUE),
-      avg_unit_margin = mean(unit_margin, na.rm=TRUE),
+      neg_margin_weeks = sum(unit_margin < rules$margin_min_per_unit &
+                               delivered_units > 0, na.rm=TRUE),
+      avg_unit_margin = mean(unit_margin[delivered_units > 0], na.rm=TRUE),
       .groups="drop"
     ) %>%
     mutate(
@@ -1897,6 +1898,11 @@ out$flows$pi %>% summarise(
 # check PI chỉ nhảy khi có internal production
 out$flows$pi %>% filter(n_sku_run==0) %>% summarise(total_pi=sum(total_costs_year/52))
 
+out$flows$purchasing %>%
+  group_by(week) %>%
+  summarise(order=sum(order_qty_units), cost=sum(purchase_cost_total)) %>%
+  arrange(week) %>% head(10)
+
 chk_week2 <- out$flows$production %>%
   group_by(week) %>%
   summarise(prod_cost=sum(production_cost),
@@ -1928,10 +1934,6 @@ out$flows$production %>%
   summarise(liters=sum(liters_required), prod=sum(produced_units)) %>%
   filter(liters>0 | prod>0)
 
-decisions_round$supply_chain$fg_production_interval_d[] <- 1
-
-out <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
-out$finance_round$ROI_pred
 ##
 # baseline
 decisions_round$supply_chain$fg_production_interval_d[] <- 9
