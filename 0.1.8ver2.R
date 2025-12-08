@@ -790,30 +790,40 @@ auto_assortment_phase3 <- function(
     sl_tbl <- tibble(customer=character(), sku=character(), service_level=numeric())
   }
   
-  sla_stat <- hist %>%
+  sla_stat <- hist %>%##update 0.2.0
     left_join(sl_tbl, by=c("customer","sku")) %>%
     mutate(
       service_level = replace_na(service_level, 0.95),
-      fill_rate = ifelse(demand_units>0, delivered_units/demand_units, 1),
-      sla_fail = fill_rate < service_level
+      # chỉ xét SLA khi có demand và *có giao hàng*
+      sla_eval = demand_units > 0 & delivered_units > 0,
+      fill_rate = ifelse(sla_eval, delivered_units/demand_units, NA_real_),
+      sla_fail = ifelse(sla_eval, fill_rate < service_level, NA)
     ) %>%
     group_by(customer, sku) %>%
     summarise(
-      weeks_obs = n_distinct(week),
-      sla_fail_rate = mean(sla_fail, na.rm=TRUE),
+      weeks_eval = sum(sla_eval, na.rm=TRUE),          # số tuần thật sự evaluate
+      sla_fail_rate = ifelse(weeks_eval>0,
+                             mean(sla_fail, na.rm=TRUE),
+                             0),                      # nếu chưa eval tuần nào thì coi như ok
       .groups="drop"
     ) %>%
     mutate(
-      sla_bad = weeks_obs >= rules$min_weeks_obs &
+      sla_bad = weeks_eval >= rules$min_weeks_obs &
         sla_fail_rate > rules$sla_fail_rate_max
     )
   
   #3) Slow mover (demand thấp so với median của customer)
   slow_stat <- base %>%
+    left_join(##Update 0.2.0
+      hist %>% group_by(customer, sku) %>%
+        summarise(ever_delivered = any(delivered_units>0), .groups="drop"),
+      by=c("customer","sku")
+    ) %>%
     group_by(customer) %>%
     mutate(
       med_dem = median(demand_week_pieces[ base_active ], na.rm=TRUE),
-      slowmover = base_active & demand_week_pieces < rules$slowmover_ratio * med_dem
+      slowmover = base_active & ever_delivered &
+        demand_week_pieces < rules$slowmover_ratio * med_dem
     ) %>%
     ungroup() %>%
     select(customer, sku, slowmover)
@@ -1855,9 +1865,9 @@ assort_auto <- auto_assortment_phase3(
   rules = list(
     margin_min_per_unit = 0,
     margin_fail_weeks   = 4,
-    sla_fail_rate_max   = 0.30,
+    sla_fail_rate_max   = 0.60,
     slowmover_ratio     = 0.20,
-    min_weeks_obs       = 4
+    min_weeks_obs       = 6
   )
 )
 
