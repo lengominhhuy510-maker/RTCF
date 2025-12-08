@@ -837,7 +837,9 @@ auto_assortment_phase3 <- function(
       margin_bad = replace_na(margin_bad, FALSE),
       sla_bad    = replace_na(sla_bad, FALSE),
       slowmover  = replace_na(slowmover, FALSE),
-      
+      #Tune rule: keep core SKUs #Update 0.2.1 floor rule
+      rank_dem = rank(-demand_week_pieces, ties.method="first"),
+      keep_core = rank_dem <= 2, # giữ top X SKU / customer
       # active logic:
       # - phải base_active trước
       # - nếu bad theo margin hoặc SLA hoặc slowmover => tắt
