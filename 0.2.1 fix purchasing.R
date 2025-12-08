@@ -1001,25 +1001,8 @@ make_sales_decisions <- function(customers, skus){
 sales_decision_cp <- make_sales_decisions(
   customers = unique(customer_master$customer),
   skus      = unique(benchmark_demand$sku)##beta 0.0.2
-) %>%
-  mutate(
-    customer             = norm_customer(customer),   #
-    promotional_pressure = str_to_lower(promotional_pressure),
-    trade_unit           = str_to_lower(trade_unit),
-    promotion_horizon    = str_to_lower(promotion_horizon),
-    order_deadline       = str_replace_all(order_deadline, "\\s+",""),
-    payment_term         = as.character(payment_term),
-    shelf_life           = as.character(shelf_life),
-    service_level        = as.numeric(service_level)
-  )
-
-# lookup CI sales theo key chuẩn (không join sku!)
-sales_ci_key <- c("customer","promotional_pressure","order_deadline","service_level",
-                  "trade_unit","payment_term","promotion_horizon","shelf_life")
-
-sales_decision_cp <- sales_decision_cp %>%
-  left_join(CIsale_lookup, by=sales_ci_key) %>%
-  mutate(ci_promised = replace_na(ci_promised, 1))
+) 
+sales_decision_cp <-refresh_ci_sales(sales_decision_cp, CIsale_lookup)
 
 # purchasing supplier_params default
 # Phase 1  chưa scrape decision purchasing param => set baseline
