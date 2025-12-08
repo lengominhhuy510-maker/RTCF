@@ -847,7 +847,7 @@ auto_assortment_phase3 <- function(
       .groups="drop"
     ) %>%
     mutate(
-      margin_bad = weeks_obs >= rules$min_weeks_obs & 
+      margin_bad = weeks_obs >= rules$min_weeks_obs*2 & ##update 0.2.3
         neg_margin_weeks >= rules$margin_fail_weeks
     )
   
@@ -904,24 +904,44 @@ auto_assortment_phase3 <- function(
     select(customer, sku, slowmover)
   
   #4) combine rules
+  #Update 0.2.3 contribution margin avg per unit from history
+  cm_hist <- hist %>%
+    mutate(cm_unit = sales_price - basic_sales_price) %>%
+    group_by(customer, sku) %>%
+    summarise(
+      cm_avg = mean(cm_unit[delivered_units > 0], na.rm=TRUE),
+      .groups="drop"
+    )
   out <- base %>%
     left_join(margin_stat, by=c("customer","sku")) %>%
     left_join(sla_stat, by=c("customer","sku")) %>%
     left_join(slow_stat, by=c("customer","sku")) %>%
+    left_join(cm_hist,     by=c("customer","sku")) %>%
+    group_by(customer) %>% #Update 0.2.2 rank theo customer
     mutate(
       margin_bad = replace_na(margin_bad, FALSE),
       sla_bad    = replace_na(sla_bad, FALSE),
       slowmover  = replace_na(slowmover, FALSE),
       #Tune rule: keep core SKUs #Update 0.2.1 floor rule
-      rank_dem = rank(-demand_week_pieces, ties.method="first"),
-      keep_core = rank_dem <= 2, # giữ top X SKU / customer
+      rank_cm = rank(-demand_week_pieces, ties.method="first"),
+      keep_core = rank_cm <= 2, # giữ top X SKU / customer
       # active logic:
       # - phải base_active trước
       # - nếu bad theo margin hoặc SLA hoặc slowmover => tắt
-      active_auto = base_active & !(margin_bad | sla_bad | slowmover)
-    ) %>%
+      active_auto = base_active & (keep_core | !(margin_bad | sla_bad | slowmover)
+    )) %>% ungroup() %>% 
     transmute(customer, sku, active = active_auto)
-  
+  #Adjustment 2: hard guarantee min 2 SKU active / customer #Update 0.2.2
+  out <- out %>%
+    left_join(base %>% select(customer, sku, demand_week_pieces), by=c("customer","sku")) %>%
+    group_by(customer) %>%
+    mutate(
+      n_active = sum(active, na.rm=TRUE),
+      rank_dem = rank(-demand_week_pieces, ties.method="first"),
+      active = ifelse(n_active < 2, rank_dem <= 2, active)
+    ) %>%
+    ungroup() %>%
+    select(customer, sku, active)
   #5) apply manual override if provided
   if (!is.null(assortment_prior) && nrow(assortment_prior)>0){
     out <- out %>%
