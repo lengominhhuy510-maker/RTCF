@@ -1014,6 +1014,71 @@ refresh_ci_sales <- function(sales_decision_cp, CIsale_lookup) {
   sales_decision_clean %>% left_join(CIsale_lookup, by = sales_ci_key) %>%
     mutate(ci_promised = replace_na(ci_promised, 1))
 }
+##Phase 3 helper
+#Sale agreement
+apply_sales_agreement_customer <- function(sales_decision_cp, CIsale_lookup, idx_by_customer){
+  # idx_by_customer: named int vector, names = customer
+  
+  sale_choices <- CIsale_lookup %>%
+    mutate(sale_idx = row_number())
+  
+  out <- sales_decision_cp %>%
+    select(customer, sku) %>%
+    left_join(
+      tibble(customer = names(idx_by_customer),
+             sale_idx = as.integer(idx_by_customer)),
+      by="customer"
+    ) %>%
+    mutate(sale_idx = replace_na(sale_idx, 1L)) %>%
+    left_join(
+      sale_choices %>%
+        select(sale_idx, promotional_pressure, order_deadline, service_level,
+               trade_unit, payment_term, promotion_horizon, shelf_life),
+      by="sale_idx"
+    ) %>%
+    select(-sale_idx)
+  
+  refresh_ci_sales(out, CIsale_lookup)
+}
+#Purchasing agrewement
+apply_purch_agreement_component <- function(supplier_params_default, CIpur_lookup, idx_by_component){
+  
+  pur_choices <- CIpur_lookup %>%
+    mutate(pur_idx = row_number())
+  
+  out <- supplier_params_default %>%
+    select(component) %>% # <<< bỏ vendor ở đây để tránh vendor.x/vendor.y
+    left_join(
+      tibble(component = names(idx_by_component),
+             pur_idx = as.integer(idx_by_component)),
+      by="component"
+    ) %>%
+    mutate(pur_idx = replace_na(pur_idx, 1L)) %>%
+    left_join(
+      pur_choices %>%
+        select(pur_idx, vendor, quality, delivery_window, delivery_reliability,
+               trade_unit, payment_term),
+      by="pur_idx"
+    ) %>%
+    mutate(
+      # hard constraint bottleneck reliability
+      delivery_reliability =
+        ifelse(component %in% c("vitamin_c","pet"),
+               pmax(delivery_reliability, 95),
+               delivery_reliability)
+    ) %>%
+    select(component, vendor, quality, delivery_window,
+           delivery_reliability, trade_unit, payment_term)
+  
+  refresh_ci_purch(out, CIpur_lookup)
+}
+#safty helper phase 3
+safe_key <- function(x){
+  x <- as.character(x)
+  x <- stringr::str_replace_all(x, "[^A-Za-z0-9]+", "_")
+  x <- stringr::str_replace_all(x, "_+", "_")
+  x
+}
 # =========================
 # 4) DECISIONS: BUILD SALES & PURCH PARAMS DEFAULT
 # =========================
@@ -2048,6 +2113,424 @@ assort_auto    %>% arrange(customer, sku)
 
 anti_join(assortment_cp, assort_auto, by=c("customer","sku","active"))
 
+# =========================
+# Phase 3 
+# =========================
+sku_gm <- sales_area_cp %>%
+  group_by(sku) %>%
+  summarise(gm = mean(gross_margin_per_w, na.rm=TRUE), .groups="drop")
+
+gm_cut <- median(sku_gm$gm, na.rm=TRUE)
+
+sku_segment <- sku_gm %>%
+  mutate(segment = ifelse(gm >= gm_cut, "innovative", "functional")) %>%
+  select(sku, segment)
+##Wrapper safty avoid boom
+suggest_int_r <- function(trial, name, low, high){
+  val <- trial$suggest_int(name, as.integer(low), as.integer(high))
+  val <- reticulate::py_to_r(val)
+  if (length(val) != 1) stop("suggest_int returned non-scalar for ", name)
+  as.integer(val)
+}
+
+suggest_float_r <- function(trial, name, low, high){
+  val <- trial$suggest_float(name, as.numeric(low), as.numeric(high))
+  val <- reticulate::py_to_r(val)
+  if (length(val) != 1) stop("suggest_float returned non-scalar for ", name)
+  as.numeric(val)
+}
+
+suggest_cat_r <- function(trial, name, choices){
+  val <- trial$suggest_categorical(name, choices)
+  val <- reticulate::py_to_r(val)
+  if (length(val) != 1) stop("suggest_categorical returned non-scalar for ", name)
+  val
+}
+##Objecttive Optuna function
+objective_r <- function(trial){
+  
+  # (0) Base vectors cho RM safety stock & lot size
+  rm_ss_base  <- decisions_round$supply_chain$rm_safety_stock_w
+  rm_lot_base <- decisions_round$supply_chain$rm_lot_size_w
+  
+  #(1) SALES AGREEMENT per CUSTOMER
+  customers <- unique(customer_master$customer)%>% as.character()
+  n_sale <- nrow(CIsale_lookup)
+  
+  sale_idx <- purrr::map_int(customers, function(cu){
+    key <- paste0("sale_", safe_key(cu))
+    suggest_int_r(trial, key, 1L, n_sale)
+  })
+  names(sale_idx) <- customers
+  
+  sales_decision_trial <- apply_sales_agreement_customer(
+    sales_decision_cp, CIsale_lookup, sale_idx
+  )
+  
+  #(2) PURCH AGREEMENT per COMPONENT
+  components <- unique(supplier_params_default$component)%>% as.character()
+  n_pur <- nrow(CIpur_lookup)
+  
+  pur_idx <- purrr::map_int(components, function(co){
+    key <- paste0("pur_", safe_key(co))
+    suggest_int_r(trial, key, 1L, n_pur)
+  })
+  names(pur_idx) <- components
+  
+  supplier_params_trial <- apply_purch_agreement_component(
+    supplier_params_default, CIpur_lookup, pur_idx
+  )
+  
+  #(3a) SUPPLY CHAIN FG knobs theo segment (như cũ)
+  fg_ss_func   <- suggest_float_r(trial, "fg_ss_func", 0, 2)
+  fg_int_func  <- suggest_int_r(trial, "fg_int_func", 7L, 25L)
+  
+  fg_ss_inno   <- suggest_float_r(trial, "fg_ss_inno", 2, 6)
+  fg_int_inno  <- suggest_int_r(trial, "fg_int_inno", 1L, 10L)
+  
+  frozen_w     <- suggest_int_r(trial, "frozen_w", 1L, 4L)
+  # build per-SKU vectors
+  fg_ss_vec  <- setNames(rep(0, length(df_sku$sku)), df_sku$sku)
+  fg_int_vec <- setNames(rep(9, length(df_sku$sku)), df_sku$sku)
+  
+  for(s in df_sku$sku){
+    seg <- sku_segment$segment[match(s, sku_segment$sku)]
+    if (is.na(seg) || seg=="functional"){
+      fg_ss_vec[s]  <- fg_ss_func
+      fg_int_vec[s] <- fg_int_func
+    } else {
+      fg_ss_vec[s]  <- fg_ss_inno
+      fg_int_vec[s] <- fg_int_inno
+    }
+  }
+  
+  #(3b) NEW: RM safety stock cho TẤT CẢ components
+  # - pet, vitamin_c: [1;6]
+  # - pack, orange, mango: [1;8]
+  rm_ss_vec <- rm_ss_base
+  for (comp in names(rm_ss_vec)) {
+    if (comp %in% c("pet", "vitamin_c")) {
+      low <- 1; high <- 6
+    } else {
+      low <- 1; high <- 8
+    }
+    key <- paste0("rm_ss_", comp)
+    val <- suggest_float_r(trial, key, low, high)
+    rm_ss_vec[comp] <- val
+  }
+  
+  #(3c) NEW: RM lot size
+  # global base [1;10] + override cho PET & VitC [4;10]
+  rm_lot_all  <- suggest_int_r(trial, "rm_lot_all", 1L, 10L)
+  rm_lot_pet  <- suggest_int_r(trial, "rm_lot_pet", 4L, 10L)
+  rm_lot_vitc <- suggest_int_r(trial, "rm_lot_vitamin_c", 4L, 10L)
+  
+  rm_lot_vec <- rm_lot_base
+  rm_lot_vec[] <- rm_lot_all
+  if ("pet" %in% names(rm_lot_vec))        rm_lot_vec["pet"]       <- rm_lot_pet
+  if ("vitamin_c" %in% names(rm_lot_vec)) rm_lot_vec["vitamin_c"] <- rm_lot_vitc
+  
+  #(3d) NEW: Shortage rule (3 options)
+  shortage_rule <- suggest_cat_r(
+    trial, "shortage_rule",
+    c("proportional","fcfs","priority")
+  )
+  
+  #(3e) NEW: Operations knobs
+  fg_pallet_locations <- suggest_int_r(trial, "fg_pallet_locations", 500L, 5000L)
+  rm_pallet_locations <- suggest_int_r(trial, "rm_pallet_locations", 500L, 5000L)
+  n_fte_rm_wh         <- suggest_int_r(trial, "n_fte_rm_wh", 2L, 20L)
+  n_fte_bottling      <- suggest_int_r(trial, "n_fte_bottling", 2L, 20L)
+  num_shifts          <- suggest_int_r(trial, "num_shifts", 1L, 5L)
+  rm_inspection_on    <- suggest_cat_r(trial, "rm_inspection_on", c(FALSE, TRUE))
+  
+  #(4) assemble decisions
+  decisions_trial <- decisions_round
+  
+  # sales & purchasing từ lookup index
+  decisions_trial$sales$customer_product_level <- sales_decision_trial
+  decisions_trial$purchasing$supplier_params   <- supplier_params_trial
+  
+  # FG knobs
+  decisions_trial$supply_chain$fg_safety_stock_w        <- fg_ss_vec
+  decisions_trial$supply_chain$fg_production_interval_d <- fg_int_vec
+  decisions_trial$supply_chain$frozen_period_weeks      <- frozen_w
+  
+  # NEW: RM knobs
+  decisions_trial$supply_chain$rm_safety_stock_w <- rm_ss_vec
+  decisions_trial$supply_chain$rm_lot_size_w     <- rm_lot_vec
+  
+  # NEW: shortage rule
+  decisions_trial$sales$shortage_rule <- shortage_rule
+  
+  # NEW: operations knobs
+  decisions_trial$operations$fg_pallet_locations <- fg_pallet_locations
+  decisions_trial$operations$rm_pallet_locations <- rm_pallet_locations
+  decisions_trial$operations$n_fte_rm_wh         <- n_fte_rm_wh
+  decisions_trial$operations$n_fte_bottling      <- n_fte_bottling
+  decisions_trial$operations$num_shifts          <- num_shifts
+  decisions_trial$operations$rm_inspection_on    <- rm_inspection_on
+  
+  # keep assortment fixed từ auto CM nếu muốn:
+  # decisions_trial$sales$assortment_cp <- decisions_round$sales$assortment_cp
+  
+  #(5) run 26w
+  out_trial <- engine_round(
+    state0 = state0_round,
+    decisions = decisions_trial,
+    constants = constants,
+    lookups = lookups,
+    exogenous = exo,
+    n_weeks = 26
+  )
+  
+  roi <- out_trial$finance_round$ROI_pred
+  if (!is.finite(roi)) roi <- -1e9
+  roi
+}
+# =========================
+# A) RECONSTRUCT BEST DECISIONS FROM OPTUNA PARAMS
+# =========================
+reconstruct_best_decisions <- function(
+    best_params,
+    decisions_base,
+    sales_decision_cp,
+    supplier_params_default,
+    CIsale_lookup,
+    CIpur_lookup,
+    customer_master,
+    df_sku,
+    sku_segment
+){
+  
+  #1) SALES agreement per customer
+  customers <- unique(customer_master$customer)
+  
+  sale_idx <- purrr::map_int(customers, function(cu){
+    key <- paste0("sale_", safe_key(cu))
+    val <- best_params[[key]]
+    if (is.null(val)) 1L else as.integer(val)
+  })
+  names(sale_idx) <- customers
+  
+  sales_decision_best <- apply_sales_agreement_customer(
+    sales_decision_cp = sales_decision_cp,
+    CIsale_lookup = CIsale_lookup,
+    idx_by_customer = sale_idx
+  )
+  
+  #2) PURCH agreement per component
+  components <- unique(supplier_params_default$component)
+  
+  pur_idx <- purrr::map_int(components, function(co){
+    key <- paste0("pur_", safe_key(co))
+    val <- best_params[[key]]
+    if (is.null(val)) 1L else as.integer(val)
+  })
+  names(pur_idx) <- components
+  
+  supplier_params_best <- apply_purch_agreement_component(
+    supplier_params_default = supplier_params_default,
+    CIpur_lookup = CIpur_lookup,
+    idx_by_component = pur_idx
+  )
+  
+  #3a) SUPPLY CHAIN FG knobs
+  fg_ss_func  <- best_params[["fg_ss_func"]]  %||% 3
+  fg_int_func <- best_params[["fg_int_func"]] %||% 9
+  
+  fg_ss_inno  <- best_params[["fg_ss_inno"]]  %||% 3
+  fg_int_inno <- best_params[["fg_int_inno"]] %||% 9
+  
+  frozen_w    <- best_params[["frozen_w"]] %||% 2
+  
+  fg_ss_vec  <- setNames(rep(0, length(df_sku$sku)), df_sku$sku)
+  fg_int_vec <- setNames(rep(9, length(df_sku$sku)), df_sku$sku)
+  
+  for(s in df_sku$sku){
+    seg <- sku_segment$segment[match(s, sku_segment$sku)]
+    if (is.na(seg) || seg == "functional"){
+      fg_ss_vec[s]  <- fg_ss_func
+      fg_int_vec[s] <- fg_int_func
+    } else {
+      fg_ss_vec[s]  <- fg_ss_inno
+      fg_int_vec[s] <- fg_int_inno
+    }
+  }
+  
+  #3b) NEW: RM safety stock cho TẤT CẢ components
+  rm_ss_vec <- decisions_base$supply_chain$rm_safety_stock_w
+  for (comp in names(rm_ss_vec)) {
+    key <- paste0("rm_ss_", comp)
+    val <- best_params[[key]]
+    if (!is.null(val)) {
+      rm_ss_vec[comp] <- as.numeric(val)
+    }
+  }
+  
+  #3c) NEW: RM lot size
+  rm_lot_vec <- decisions_base$supply_chain$rm_lot_size_w
+  
+  rm_lot_all <- best_params[["rm_lot_all"]]
+  if (!is.null(rm_lot_all)) {
+    rm_lot_vec[] <- as.numeric(rm_lot_all)
+  }
+  
+  rm_lot_pet <- best_params[["rm_lot_pet"]]
+  if (!is.null(rm_lot_pet) && "pet" %in% names(rm_lot_vec)) {
+    rm_lot_vec["pet"] <- as.numeric(rm_lot_pet)
+  }
+  
+  rm_lot_vitc <- best_params[["rm_lot_vitamin_c"]]
+  if (!is.null(rm_lot_vitc) && "vitamin_c" %in% names(rm_lot_vec)) {
+    rm_lot_vec["vitamin_c"] <- as.numeric(rm_lot_vitc)
+  }
+  
+  #3d) NEW: shortage rule
+  shortage_rule <- best_params[["shortage_rule"]] %||%
+    decisions_base$sales$shortage_rule %||%
+    "proportional"
+  
+  #3e) NEW: operations knobs
+  fg_pallet_locations <- best_params[["fg_pallet_locations"]] %||%
+    decisions_base$operations$fg_pallet_locations
+  rm_pallet_locations <- best_params[["rm_pallet_locations"]] %||%
+    decisions_base$operations$rm_pallet_locations
+  n_fte_rm_wh <- best_params[["n_fte_rm_wh"]] %||%
+    decisions_base$operations$n_fte_rm_wh
+  n_fte_bottling <- best_params[["n_fte_bottling"]] %||%
+    decisions_base$operations$n_fte_bottling
+  num_shifts <- best_params[["num_shifts"]] %||%
+    decisions_base$operations$num_shifts
+  rm_inspection_on <- best_params[["rm_inspection_on"]] %||%
+    decisions_base$operations$rm_inspection_on
+  
+  #4) Assemble decisions
+  decisions_best <- decisions_base
+  decisions_best$sales$customer_product_level <- sales_decision_best
+  decisions_best$purchasing$supplier_params   <- supplier_params_best
+  
+  decisions_best$supply_chain$fg_safety_stock_w        <- fg_ss_vec
+  decisions_best$supply_chain$fg_production_interval_d <- fg_int_vec
+  decisions_best$supply_chain$frozen_period_weeks      <- as.integer(frozen_w)
+  
+  # NEW: RM knobs
+  decisions_best$supply_chain$rm_safety_stock_w <- rm_ss_vec
+  decisions_best$supply_chain$rm_lot_size_w     <- rm_lot_vec
+  
+  # NEW: shortage rule
+  decisions_best$sales$shortage_rule <- shortage_rule
+  
+  # NEW: operations knobs
+  decisions_best$operations$fg_pallet_locations <- as.integer(fg_pallet_locations)
+  decisions_best$operations$rm_pallet_locations <- as.integer(rm_pallet_locations)
+  decisions_best$operations$n_fte_rm_wh         <- as.integer(n_fte_rm_wh)
+  decisions_best$operations$n_fte_bottling      <- as.integer(n_fte_bottling)
+  decisions_best$operations$num_shifts          <- as.integer(num_shifts)
+  decisions_best$operations$rm_inspection_on    <- as.logical(rm_inspection_on)
+  
+  decisions_best
+}
+# =========================
+# B) SAVE BEST DECISIONS TO EXCEL
+# =========================
+##Optuna TPE
+optuna <- reticulate::import("optuna")
+
+objective_py <- reticulate::r_to_py(objective_r)
+study <- optuna$create_study(
+  direction = "maximize",
+  sampler = optuna$samplers$TPESampler(seed=as.integer(42))
+)
+
+study$optimize(objective_py, n_trials = 1000)
+
+best <- study$best_trial
+best$value
+best$params
+
+decisions_best <- reconstruct_best_decisions(
+  best_params = best$params,
+  decisions_base = decisions_round,
+  sales_decision_cp = sales_decision_cp,
+  supplier_params_default = supplier_params_default,
+  CIsale_lookup = CIsale_lookup,
+  CIpur_lookup  = CIpur_lookup,
+  customer_master = customer_master,
+  df_sku = df_sku,
+  sku_segment = sku_segment
+)
+
+out_best <- engine_round(state0_round, decisions_best, constants, lookups, exo, 26)
+out_best$finance_round$ROI_pred
+out_best$finance_round
+
+# (optional) export Excel
+save_best_decisions_excel(decisions_best, out_dir = "best_output", prefix = "round1")
+
+save_best_decisions_excel <- function(decisions_best, out_dir="best_output", prefix="round1"){
+  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+  
+  # lấy các block chính
+  sales_cp   <- decisions_best$sales$customer_product_level %||% tibble()
+  assort_cp  <- decisions_best$sales$assortment_cp %||% tibble()
+  purch_cp   <- decisions_best$purchasing$supplier_params %||% tibble()
+  
+  # knobs supply_chain: list (vector named) -> long table
+  sc_list <- decisions_best$supply_chain %||% list()
+  sc_knobs <- purrr::imap_dfr(sc_list, function(v, k){
+    if (is.atomic(v) && length(v) > 0) {
+      tibble(
+        group = "supply_chain",
+        knob  = k,
+        key   = if (!is.null(names(v))) names(v) else NA_character_,
+        value = as.numeric(v)
+      )
+    } else {
+      tibble(group="supply_chain", knob=k, key=NA_character_, value=NA_real_)
+    }
+  })
+  
+  # knobs operations
+  ops_list <- decisions_best$operations %||% list()
+  ops_knobs <- purrr::imap_dfr(ops_list, function(v, k){
+    tibble(
+      group = "operations",
+      knob  = k,
+      key   = NA_character_,
+      value = as.numeric(v)
+    )
+  })
+  
+  # sales knobs (shortage_rule etc.)
+  sales_list <- decisions_best$sales %||% list()
+  sales_knobs <- purrr::imap_dfr(sales_list, function(v, k){
+    if (is.atomic(v) && length(v)==1 && !is.data.frame(v)) {
+      tibble(group="sales", knob=k, key=NA_character_,
+             value=as.character(v))
+    } else {
+      NULL
+    }
+  })
+  
+  file_path <- file.path(out_dir, paste0(prefix, "_best_decisions.xlsx"))
+  
+  writexl::write_xlsx(
+    list(
+      sales_customer_product_level = sales_cp,
+      sales_assortment             = assort_cp,
+      purchasing_supplier_params   = purch_cp,
+      knobs_supply_chain           = sc_knobs,
+      knobs_operations             = ops_knobs,
+      knobs_sales                  = sales_knobs
+    ),
+    path = file_path
+  )
+  
+  message("Saved to: ", normalizePath(file_path))
+  invisible(file_path)
+}
+save_best_decisions_excel(decisions_best, out_dir="best_output", prefix="round1")
 
 ##
 sum(out$flows$sales$revenue, na.rm=TRUE)
