@@ -2181,7 +2181,7 @@ objective_r <- function(trial){
     supplier_params_default, CIpur_lookup, pur_idx
   )
   
-  #(3a) SUPPLY CHAIN FG knobs theo segment (như cũ)
+  #(3a) SUPPLY CHAIN FG knobs theo segment 
   fg_ss_func   <- suggest_float_r(trial, "fg_ss_func", 0, 2)
   fg_int_func  <- suggest_int_r(trial, "fg_int_func", 7L, 25L)
   
@@ -2470,8 +2470,7 @@ save_best_decisions_excel(decisions_best, out_dir = "best_output", prefix = "rou
 
 save_best_decisions_excel <- function(decisions_best, out_dir="best_output", prefix="round1"){
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-  
-  # lấy các block chính
+  # pick main block
   sales_cp   <- decisions_best$sales$customer_product_level %||% tibble()
   assort_cp  <- decisions_best$sales$assortment_cp %||% tibble()
   purch_cp   <- decisions_best$purchasing$supplier_params %||% tibble()
@@ -2490,7 +2489,6 @@ save_best_decisions_excel <- function(decisions_best, out_dir="best_output", pre
       tibble(group="supply_chain", knob=k, key=NA_character_, value=NA_real_)
     }
   })
-  
   # knobs operations
   ops_list <- decisions_best$operations %||% list()
   ops_knobs <- purrr::imap_dfr(ops_list, function(v, k){
@@ -2501,7 +2499,6 @@ save_best_decisions_excel <- function(decisions_best, out_dir="best_output", pre
       value = as.numeric(v)
     )
   })
-  
   # sales knobs (shortage_rule etc.)
   sales_list <- decisions_best$sales %||% list()
   sales_knobs <- purrr::imap_dfr(sales_list, function(v, k){
@@ -2512,9 +2509,7 @@ save_best_decisions_excel <- function(decisions_best, out_dir="best_output", pre
       NULL
     }
   })
-  
   file_path <- file.path(out_dir, paste0(prefix, "_best_decisions.xlsx"))
-  
   writexl::write_xlsx(
     list(
       sales_customer_product_level = sales_cp,
@@ -2526,11 +2521,11 @@ save_best_decisions_excel <- function(decisions_best, out_dir="best_output", pre
     ),
     path = file_path
   )
-  
   message("Saved to: ", normalizePath(file_path))
   invisible(file_path)
 }
 save_best_decisions_excel(decisions_best, out_dir="best_output", prefix="round1")
+
 
 ##
 sum(out$flows$sales$revenue, na.rm=TRUE)
