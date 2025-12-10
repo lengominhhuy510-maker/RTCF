@@ -1042,42 +1042,62 @@ refresh_ci_sales <- function(sales_decision_cp, CIsale_lookup) {
 ##Phase 3 helper
 #Sale agreement
 apply_sales_agreement_customer <- function(sales_decision_cp, CIsale_lookup, idx_by_customer){
-  # idx_by_customer: named int vector, names = customer
   
+  # chuẩn hoá lookup + đánh số sale_idx riêng cho từng customer
   sale_choices <- CIsale_lookup %>%
-    mutate(sale_idx = row_number())
+    mutate(customer = norm_customer(customer)) %>%
+    group_by(customer) %>%
+    mutate(sale_idx = dplyr::row_number()) %>%
+    ungroup()
   
-  out <- sales_decision_cp %>%
-    mutate(customer = norm_customer(customer),
-           sku = stringr::str_squish(sku)) %>%
-    select(customer, sku) %>%
-    left_join(
-      tibble(customer = names(idx_by_customer),
-             sale_idx = as.integer(idx_by_customer)),
-      by="customer"
-    ) %>%
-    mutate(sale_idx = replace_na(sale_idx, 1L)) %>%
+  # bảng index từ best_params / trial, clamp về [1; max_idx] cho từng customer
+  idx_tbl <- tibble(
+    customer = names(idx_by_customer),
+    sale_idx = as.integer(idx_by_customer)
+  ) %>%
+    mutate(customer = norm_customer(customer)) %>%
     left_join(
       sale_choices %>%
-        select(sale_idx, promotional_pressure, order_deadline, service_level,
-               trade_unit, payment_term, promotion_horizon, shelf_life, ci_promised),
-      by="sale_idx"
+        group_by(customer) %>%
+        summarise(max_idx = max(sale_idx), .groups = "drop"),
+      by = "customer"
+    ) %>%
+    mutate(
+      max_idx  = replace_na(max_idx, 1L),
+      sale_idx = pmax(1L, pmin(sale_idx, max_idx))
+    ) %>%
+    select(customer, sale_idx)
+  
+  out <- sales_decision_cp %>%
+    mutate(
+      customer = norm_customer(customer),
+      sku      = stringr::str_squish(sku)
+    ) %>%
+    select(customer, sku) %>%
+    left_join(idx_tbl, by = "customer") %>%
+    left_join(
+      sale_choices %>%
+        select(customer, sale_idx,
+               promotional_pressure, order_deadline, service_level,
+               trade_unit, payment_term, promotion_horizon, shelf_life,
+               ci_promised),
+      by = c("customer", "sale_idx")
     ) %>%
     select(-sale_idx) %>%
     mutate(
-      # đảm bảo type sạch cho engine
       promotional_pressure = str_to_lower(promotional_pressure),
-      trade_unit = str_to_lower(trade_unit),
-      promotion_horizon = str_to_lower(promotion_horizon),
-      order_deadline = stringr::str_replace_all(order_deadline, "\\s+",""),
-      payment_term = as.character(payment_term),
-      shelf_life = as.character(shelf_life),
-      service_level = as.numeric(service_level),
-      ci_promised = as.numeric(ci_promised)
+      trade_unit           = str_to_lower(trade_unit),
+      promotion_horizon    = str_to_lower(promotion_horizon),
+      order_deadline       = stringr::str_replace_all(order_deadline, "\\s+",""),
+      payment_term         = as.character(payment_term),
+      shelf_life           = as.character(shelf_life),
+      service_level        = as.numeric(service_level),
+      ci_promised          = as.numeric(ci_promised)
     )
   
   out
 }
+
 #Purchasing agrewement
 apply_purch_agreement_component <- function(supplier_params_default, CIpur_lookup, idx_by_component){
   
