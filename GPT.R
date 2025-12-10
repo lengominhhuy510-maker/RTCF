@@ -1,3 +1,20 @@
+library(writexl)
+library(tibble)
+library(openxlsx)
+library(readxl)
+library(highcharter)
+library(dplyr)
+library(data.table)
+library(DT)
+library(tidyverse)
+library(purrr)
+library(tibble)
+library(janitor)
+library(reticulate)
+reticulate::use_condaenv("base", conda = "C:/Users/PC/anaconda3/Scripts/conda.exe",required = TRUE)##
+optuna <- reticulate::import("optuna")##
+print("Kết nối Optuna thành công!")##
+reticulate::py_get_attr(optuna, "__version__")##
 # =========================
 # 0) LOAD DATA
 # =========================
@@ -101,6 +118,30 @@ CIpur_lookup <- CIpur_lookup %>%
   ) %>%
   select(vendor, quality, delivery_window, delivery_reliability,
          trade_unit, payment_term, ci_purch)
+##Update phase 3
+CIsale_lookup <- CIsale_lookup %>%
+  mutate(
+    customer = norm_customer(customer),
+    promotional_pressure = str_to_lower(promotional_pressure),
+    trade_unit = str_to_lower(trade_unit),
+    promotion_horizon = str_to_lower(promotion_horizon),
+    order_deadline = stringr::str_replace_all(order_deadline, "\\s+",""),
+    payment_term = as.character(payment_term),
+    shelf_life = as.character(round(as.numeric(shelf_life))), # tránh 80.0 vs "80"
+    service_level = as.numeric(service_level),
+    ci_promised = as.numeric(ci_promised)
+  )
+
+CIpur_lookup <- CIpur_lookup %>%
+  mutate(
+    vendor = as.character(vendor),
+    quality = str_to_lower(quality),
+    delivery_window = str_to_lower(delivery_window),
+    trade_unit = str_to_lower(trade_unit),
+    payment_term = as.character(payment_term),
+    delivery_reliability = as.numeric(readr::parse_number(as.character(delivery_reliability))),
+    ci_purch = as.numeric(ci_purch)
+  )
 # =========================
 # 2) CONSTANTS 
 # =========================
@@ -938,7 +979,7 @@ auto_assortment_phase3 <- function(
       # - phải base_active trước
       # - nếu bad theo margin hoặc SLA hoặc slowmover => tắt
       active_auto = base_active & (keep_core | !(margin_bad | sla_bad | slowmover)
-    )) %>% ungroup() %>% 
+      )) %>% ungroup() %>% 
     transmute(customer, sku, active = active_auto)
   #Adjustment 2: hard guarantee min 2 SKU active / customer #Update 0.2.2
   out <- out %>%
@@ -2464,288 +2505,80 @@ decisions_best <- reconstruct_best_decisions(
 out_best <- engine_round(state0_round, decisions_best, constants, lookups, exo, 26)
 out_best$finance_round$ROI_pred
 out_best$finance_round
-
 # (optional) export Excel
-save_best_decisions_excel(decisions_best, out_dir = "best_output", prefix = "round1")
-
-save_best_decisions_excel <- function(decisions_best, out_dir="best_output", prefix="round1"){
+save_best_decisions_excel <- function(
+    decisions_best,
+    out_dir = "best_output",
+    prefix  = "round_best",
+    best_params = NULL,
+    finance_round = NULL
+){
   if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
-  # pick main block
-  sales_cp   <- decisions_best$sales$customer_product_level %||% tibble()
-  assort_cp  <- decisions_best$sales$assortment_cp %||% tibble()
-  purch_cp   <- decisions_best$purchasing$supplier_params %||% tibble()
   
-  # knobs supply_chain: list (vector named) -> long table
-  sc_list <- decisions_best$supply_chain %||% list()
-  sc_knobs <- purrr::imap_dfr(sc_list, function(v, k){
-    if (is.atomic(v) && length(v) > 0) {
-      tibble(
-        group = "supply_chain",
-        knob  = k,
-        key   = if (!is.null(names(v))) names(v) else NA_character_,
-        value = as.numeric(v)
-      )
-    } else {
-      tibble(group="supply_chain", knob=k, key=NA_character_, value=NA_real_)
-    }
-  })
-  # knobs operations
-  ops_list <- decisions_best$operations %||% list()
-  ops_knobs <- purrr::imap_dfr(ops_list, function(v, k){
-    tibble(
-      group = "operations",
-      knob  = k,
-      key   = NA_character_,
-      value = as.numeric(v)
-    )
-  })
-  # sales knobs (shortage_rule etc.)
-  sales_list <- decisions_best$sales %||% list()
-  sales_knobs <- purrr::imap_dfr(sales_list, function(v, k){
-    if (is.atomic(v) && length(v)==1 && !is.data.frame(v)) {
-      tibble(group="sales", knob=k, key=NA_character_,
-             value=as.character(v))
-    } else {
-      NULL
-    }
-  })
-  file_path <- file.path(out_dir, paste0(prefix, "_best_decisions.xlsx"))
-  writexl::write_xlsx(
-    list(
-      sales_customer_product_level = sales_cp,
-      sales_assortment             = assort_cp,
-      purchasing_supplier_params   = purch_cp,
-      knobs_supply_chain           = sc_knobs,
-      knobs_operations             = ops_knobs,
-      knobs_sales                  = sales_knobs
-    ),
-    path = file_path
+  # 1) Sales agreement (customer x sku)
+  sales_agree <- decisions_best$sales$customer_product_level
+  
+  # 2) Assortment
+  assort <- decisions_best$sales$assortment_cp
+  
+  # 3) Purchasing agreement (component level)
+  purch_agree <- decisions_best$purchasing$supplier_params
+  
+  # 4) Supply chain knobs tidy
+  sc_knobs <- bind_rows(
+    tibble(knob="fg_safety_stock_w", name=names(decisions_best$supply_chain$fg_safety_stock_w),
+           value=as.numeric(decisions_best$supply_chain$fg_safety_stock_w)),
+    tibble(knob="fg_production_interval_d", name=names(decisions_best$supply_chain$fg_production_interval_d),
+           value=as.numeric(decisions_best$supply_chain$fg_production_interval_d)),
+    tibble(knob="rm_safety_stock_w", name=names(decisions_best$supply_chain$rm_safety_stock_w),
+           value=as.numeric(decisions_best$supply_chain$rm_safety_stock_w)),
+    tibble(knob="rm_lot_size_w", name=names(decisions_best$supply_chain$rm_lot_size_w),
+           value=as.numeric(decisions_best$supply_chain$rm_lot_size_w)),
+    tibble(knob="frozen_period_weeks", name="global",
+           value=as.numeric(decisions_best$supply_chain$frozen_period_weeks))
   )
-  message("Saved to: ", normalizePath(file_path))
-  invisible(file_path)
-}
-save_best_decisions_excel(decisions_best, out_dir="best_output", prefix="round1")
-
-##another
-save_best_bundle_excel <- function(decisions_best,
-                                   out_best = NULL,
-                                   out_dir = "best_output",
-                                   prefix = "round1") {
-  if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
   
-  # ---------- helper ----------
-  `%||%` <- function(a, b) if (!is.null(a)) a else b
+  # 5) Operations knobs
+  ops_knobs <- tibble(
+    knob = names(decisions_best$operations),
+    value = purrr::map_chr(decisions_best$operations, ~as.character(.x))
+  )
   
-  # ---------- A) decisions ----------
-  sales_cp   <- decisions_best$sales$customer_product_level %||% tibble()
-  assort_cp  <- decisions_best$sales$assortment_cp %||% tibble()
-  purch_cp   <- decisions_best$purchasing$supplier_params %||% tibble()
-  
-  # supply_chain knobs -> long
-  sc_list <- decisions_best$supply_chain %||% list()
-  sc_knobs <- purrr::imap_dfr(sc_list, function(v, k){
-    if (is.atomic(v) && length(v) > 0 && !is.data.frame(v)) {
-      tibble(
-        group = "supply_chain",
-        knob  = k,
-        key   = if (!is.null(names(v))) names(v) else NA_character_,
-        value = as.numeric(v)
-      )
-    } else {
-      tibble(group="supply_chain", knob=k, key=NA_character_, value=NA_real_)
-    }
-  })
-  
-  # operations knobs
-  ops_list <- decisions_best$operations %||% list()
-  ops_knobs <- purrr::imap_dfr(ops_list, function(v, k){
-    if (is.atomic(v) && length(v) > 0 && !is.data.frame(v)) {
-      tibble(
-        group = "operations",
-        knob  = k,
-        key   = if (!is.null(names(v))) names(v) else NA_character_,
-        value = as.numeric(v)
-      )
-    } else {
-      tibble(group="operations", knob=k, key=NA_character_, value=NA_real_)
-    }
-  })
-  
-  # sales simple knobs (shortage_rule, ...)
-  sales_list <- decisions_best$sales %||% list()
-  sales_knobs <- purrr::imap_dfr(sales_list, function(v, k){
-    if (is.atomic(v) && length(v)==1 && !is.data.frame(v)) {
-      tibble(
-        group="sales",
-        knob=k,
-        key=NA_character_,
-        value=as.character(v)
-      )
-    } else {
-      NULL
-    }
-  })
-  
-  # ---------- B) out_best ----------
-  finance_tbl <- tibble()
-  state_rm_end <- tibble()
-  state_fg_end <- tibble()
-  flows_sales <- flows_production <- flows_operations <- tibble()
-  flows_purchasing <- flows_purch_receipts <- tibble()
-  flows_inventory <- flows_warehousing <- flows_distribution <- flows_pi <- tibble()
-  
-  if (!is.null(out_best)) {
-    # finance_round is list -> 1-row tibble
-    fr <- out_best$finance_round %||% list()
-    if (length(fr) > 0) {
-      finance_tbl <- tibble::as_tibble(fr, .name_repair = "unique")
-    }
-    
-    # state_end
-    st_end <- out_best$state_end %||% list()
-    state_rm_end <- st_end$rm_stock %||% tibble()
-    state_fg_end <- st_end$fg_stock %||% tibble()
-    
-    # flows
-    fl <- out_best$flows %||% list()
-    flows_sales        <- fl$sales %||% tibble()
-    flows_production   <- fl$production %||% tibble()
-    flows_operations   <- fl$operations %||% tibble()
-    flows_purchasing   <- fl$purchasing %||% tibble()
-    flows_purch_receipts <- fl$purchasing_receipts %||% tibble()
-    flows_inventory    <- fl$inventory %||% tibble()
-    flows_warehousing  <- fl$warehousing %||% tibble()
-    flows_distribution <- fl$distribution %||% tibble()
-    flows_pi           <- fl$pi %||% tibble()
+  # 6) Best params + finance (optional)
+  best_params_tbl <- NULL
+  if (!is.null(best_params)){
+    best_params_tbl <- tibble(
+      param = names(best_params),
+      value = purrr::map_chr(best_params, ~as.character(.x))
+    )
   }
   
-  # ---------- assemble sheets ----------
+  finance_tbl <- NULL
+  if (!is.null(finance_round)){
+    finance_tbl <- tibble(
+      metric = names(finance_round),
+      value  = purrr::map_chr(finance_round, ~as.character(.x))
+    )
+  }
+  
   sheets <- list(
-    sales_customer_product_level = sales_cp,
-    sales_assortment             = assort_cp,
-    purchasing_supplier_params   = purch_cp,
-    knobs_supply_chain           = sc_knobs,
-    knobs_operations             = ops_knobs,
-    knobs_sales                  = sales_knobs,
-    finance_round                = finance_tbl,
-    state_end_rm_stock           = state_rm_end,
-    state_end_fg_stock           = state_fg_end,
-    flows_sales                  = flows_sales,
-    flows_production             = flows_production,
-    flows_operations             = flows_operations,
-    flows_purchasing             = flows_purchasing,
-    flows_purchasing_receipts    = flows_purch_receipts,
-    flows_inventory              = flows_inventory,
-    flows_warehousing            = flows_warehousing,
-    flows_distribution           = flows_distribution,
-    flows_pi                     = flows_pi
+    sales_agreement   = sales_agree,
+    assortment        = assort,
+    purchasing_agreement = purch_agree,
+    supply_chain_knobs = sc_knobs,
+    operations_knobs = ops_knobs
   )
+  if (!is.null(best_params_tbl)) sheets$best_params <- best_params_tbl
+  if (!is.null(finance_tbl))     sheets$finance_round <- finance_tbl
   
-  # remove empty NULL sheets just in case
-  sheets <- sheets[!vapply(sheets, is.null, logical(1))]
+  path <- file.path(out_dir, paste0(prefix, "_BEST_BUNDLE.xlsx"))
+  writexl::write_xlsx(sheets, path)
   
-  file_path <- file.path(out_dir, paste0(prefix, "_BEST_BUNDLE.xlsx"))
-  writexl::write_xlsx(sheets, path = file_path)
-  
-  message("Saved full bundle to: ", normalizePath(file_path))
-  invisible(file_path)
+  message("Saved to: ", path)
+  invisible(path)
 }
-save_best_bundle_excel(
-  decisions_best = decisions_best,
-  out_best = out_best,
-  out_dir = "best_output",
-  prefix = "round1"
-)
+save_best_decisions_excel(decisions_best, out_dir = "best_output", prefix = "round1")
 
-##
-sum(out$flows$sales$revenue, na.rm=TRUE)
-sum(out$flows$purchasing$purchase_cost_total, na.rm=TRUE)
-sum(out$flows$sales$pallets_shipped, na.rm=TRUE)
-summary(sales_constants$observed$benchmark_demand$demand_week_pieces)
-head(out$flows$sales)
-summary(out$flows$sales$demand_units)##not =0
-summary(out$flows$sales$delivered_units)
-##expect not divergent check
-out$flows$operations %>% summarise(avg_cost=mean(production_cost_total),
-                                   total_cost = sum(production_cost_total))
-out$finance_round$production_costs
-out$flows$warehousing %>% summarise(sum_fg_cost=sum(fg_location_cost+fg_overflow_cost))
-##check 
-out$flows$pi %>% summarise(
-  stock = mean(stock_costs_year/52),
-  startup = mean(startup_loss_cost_year/52),
-  changeover = mean(changeover_costs_year/52),
-  total = mean(total_costs_year/52)
-)
-# check PI chỉ nhảy khi có internal production
-out$flows$pi %>% filter(n_sku_run==0) %>% summarise(total_pi=sum(total_costs_year/52))
 
-out$flows$purchasing %>%
-  group_by(week) %>%
-  summarise(order=sum(order_qty_units), cost=sum(purchase_cost_total)) %>%
-  arrange(week) %>% head(10)
 
-chk_week2 <- out$flows$production %>%
-  group_by(week) %>%
-  summarise(prod_cost=sum(production_cost),
-            liters=sum(liters_required),
-            .groups="drop") %>% print()
 
-kpi_week2 <- out$flows$operations %>%
-  transmute(week, kpi_cost=production_cost_total, idle_cost) %>% print()
-
-chk_week2 %>%
-  left_join(kpi_week2, by="week") %>%
-  mutate(total_prod_cost = prod_cost + idle_cost,
-         diff = total_prod_cost - kpi_cost) %>%
-  summarise(max_abs_diff = max(abs(diff)))
-sum(out$flows$operations$production_cost_total) -
-  (sum(out$flows$production$production_cost) + sum(out$flows$operations$idle_cost))
-
-out$flows$sales %>% summarise(demand=sum(demand_units), delivered=sum(delivered_units))
-summary(out$flows$sales$sales_price)
-summary(out$flows$production$produced_units)
-
-##Sanity check 
-out$flows$sales %>% 
-  summarise(total_demand=sum(demand_units),
-            total_delivered=sum(delivered_units),
-            fill_rate=total_delivered/total_demand)##check why revenue is low rely on demand not fullfill by RM leadtime + safty stock?
-out$flows$production %>%
-  group_by(week) %>%
-  summarise(liters=sum(liters_required), prod=sum(produced_units)) %>%
-  filter(liters>0 | prod>0)
-
-##
-# baseline
-decisions_round$supply_chain$fg_production_interval_d[] <- 9
-outB <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
-
-# scenario A
-decisions_round$supply_chain$fg_production_interval_d[] <- 1
-outA <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
-
-outB$flows$pi %>% summarise(
-  stock = mean(stock_costs_year/52),
-  startup = mean(startup_loss_cost_year/52),
-  changeover = mean(changeover_costs_year/52),
-  total = mean(total_costs_year/52)
-)
-
-outA$flows$pi %>% summarise(
-  stock = mean(stock_costs_year/52),
-  startup = mean(startup_loss_cost_year/52),
-  changeover = mean(changeover_costs_year/52),
-  total = mean(total_costs_year/52)
-)
-outB$finance_round$ROI_pred
-outB$finance_round
-head(out$flows$pi)
-
-decisions_round$supply_chain$frozen_period_weeks <- 1
-out1 <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
-out1$finance_round
-
-decisions_round$supply_chain$frozen_period_weeks <- 4
-out4 <- engine_round(state0_round, decisions_round, constants, lookups, exo, 26)
-out4$finance_round
