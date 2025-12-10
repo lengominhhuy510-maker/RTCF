@@ -2484,7 +2484,7 @@ study <- optuna$create_study(
   sampler = optuna$samplers$TPESampler(seed=as.integer(42))
 )
 
-study$optimize(objective_py, n_trials = 1000)
+study$optimize(objective_py, n_trials = 5)
 
 best <- study$best_trial
 best$value
