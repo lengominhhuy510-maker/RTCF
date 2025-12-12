@@ -655,10 +655,20 @@ rm_warehouse_week <- function(week, state, lookups, operations_constants,
 }
 ##update helper admin beta 0.0.7
 admin_cost_week <- function(week, orders_w, sales_exec_w, purchasing_constants){
+  # Đảm bảo luôn có đầy đủ key cost, nếu thiếu thì mặc định =0 để tránh NA/NULL
+  adm_defaults <- list(
+    inbound_order = 0,
+    inbound_orderline = 0,
+    outbound_order = 0,
+    outbound_orderline = 0,
+    supplier_maintenance = 0
+  )
   
-  adm <- purchasing_constants$admin
+  adm <- modifyList(adm_defaults, purchasing_constants$admin)
   
-  inbound_orders     <- nrow(orders_w)
+  # 1 PO header cho mỗi vendor/tuần (tránh đếm trùng nhiều line cùng vendor)
+  inbound_orders     <- orders_w %>% distinct(vendor, week) %>% nrow()
+  
   inbound_orderlines <- nrow(orders_w)   # Phase 2 đơn giản coi 1 line = 1 orderline
   
   outbound_orders     <- sales_exec_w %>% distinct(customer, week) %>% nrow()
@@ -1357,13 +1367,26 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
   if (is.null(lot_w))  lot_w  <- setNames(rep(1,nrow(rm_need)), rm_need$component)
   ##update 0.2.1
   #base reorder need (weeks-of-demand)
+  ##codex fix
+  rm_pipeline <- state$rm_pipeline %||% tibble()
+  if (nrow(rm_pipeline) == 0 || !"component" %in% names(rm_pipeline)) {
+    rm_on_order <- tibble(component = character(), on_order_units = double())
+  } else {
+    rm_on_order <- rm_pipeline %>%
+      group_by(component) %>%
+      summarise(on_order_units = sum(order_qty_units, na.rm = TRUE), .groups = "drop")
+  }
+  
   reorder_tbl <- rm_need %>%
     left_join(rm_stock, by="component") %>%
+    left_join(rm_on_order, by = "component") %>% ##codex
     mutate(
       rm_units=replace_na(rm_units,0),
+      on_order_units = replace_na(on_order_units, 0),
+      net_stock_units = rm_units + on_order_units,
       target_ss_units = ssrm_w[component] * rm_week_need,
       lot_units = lot_w[component] * rm_week_need,
-      order_units_raw = ifelse(rm_units < target_ss_units, lot_units, 0)
+      order_units_raw = ifelse(net_stock_units < target_ss_units, lot_units, 0)
     ) %>%
     # join supplier params for trade_unit + vendor + ci
     left_join(supplier_params %>% 
@@ -1427,7 +1450,8 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
       purchase_price,
       purchase_cost_total,
       trade_unit
-    )
+    ) %>%
+  distinct()  # tránh nhân đôi order giống hệt nhau làm phình cost
   
   #tank yard / inbound handling cost (book at order week)
   tank_const <- operations_constants$tank_yard
@@ -1804,10 +1828,20 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
     warehouse_costs + scrap_costs + admin_costs+ pi_costs_week+ tank_yard_costs
   gross_margin <- revenue - cogs
   
-  dist_costs <- sum(purrr::map_dbl(
-    flows$sales$pallets_shipped,
-    ~calc_distribution_cost(.x, finance_constants=finance_constants)
-  ), na.rm=TRUE)
+  # Distribution cost tính theo tổng pallets mỗi tuần để tránh tính base cost
+  # cho từng order line riêng lẻ (dễ bị đội chi phí). Nếu không có dữ liệu
+  # sales thì chi phí phân phối = 0.
+  dist_costs <- 0
+  if (!is.null(flows$sales) && nrow(flows$sales) > 0) {
+    pallets_by_week <- flows$sales %>%
+      dplyr::group_by(week) %>%
+      dplyr::summarise(pallets_shipped = sum(pallets_shipped, na.rm = TRUE), .groups = "drop")
+    
+    dist_costs <- sum(purrr::map_dbl(
+      pallets_by_week$pallets_shipped,
+      ~calc_distribution_cost(.x, finance_constants = finance_constants)
+    ), na.rm = TRUE)
+  }
   
   operating_profit <- gross_margin - dist_costs
   
@@ -1957,8 +1991,10 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
       filter(eta_week == w) %>%left_join(decisions$purchasing$supplier_params %>%
                                            select(component, delivery_reliability),
                                          by="component") %>% #update beta 0.1.1
-      transmute(week=w, component, 
-                received_qty_units=order_qty_units*replace_na(delivery_reliability,100)/100) ##update beta 0.1.1
+      transmute(week=w, component,
+                received_qty_units=order_qty_units*replace_na(delivery_reliability,100)/100) %>%  ##update beta 0.1.1
+      distinct() # phòng duplicate receipts do pipeline ghi lặp
+    
     # keep future pipeline only update phase 2
     state$rm_pipeline <- state$rm_pipeline %>%
       filter(eta_week > w)
@@ -2561,7 +2597,7 @@ study <- optuna$create_study(
   sampler = optuna$samplers$TPESampler(seed=as.integer(42))
 )
 
-study$optimize(objective_py, n_trials = 100)
+study$optimize(objective_py, n_trials = 1000)
 
 best <- study$best_trial
 best$value
