@@ -2482,7 +2482,7 @@ out_base$finance_round
 
 # auto assortment từ history vừa rồi
 enable_auto_assortment_round1 <- FALSE
-
+assortment_cp <- decisions_round$sales$assortment_cp##codex2
 if (enable_auto_assortment_round1) {
   # auto assortment từ history vừa rồi
   assort_auto <- auto_assortment_phase3(
@@ -2589,9 +2589,9 @@ fg_init_tbl_r1 <- tibble::tibble(
 state0_round1$fg_stock <- state0_round1$fg_stock %>%
   dplyr::left_join(fg_init_tbl_r1 %>% dplyr::select(sku, init_units), by="sku") %>%
   dplyr::mutate(
-    units = dplyr::coalesce(init_units, 0),
-    age_w = ifelse(units > 0, 1, 0),
-    obsolete_units = 0
+    units = dplyr::coalesce(init_units, units, 0),
+    age_w = dplyr::if_else(!is.na(init_units), dplyr::if_else(init_units > 0, 1, 0), age_w),
+    obsolete_units = dplyr::if_else(!is.na(init_units), 0, obsolete_units)
   ) %>%
   dplyr::select(sku, units, age_w, obsolete_units)
 
@@ -2632,7 +2632,7 @@ rm_init_tbl_r1 <- tibble::tibble(
 state0_round1$rm_stock <- state0_round1$rm_stock %>%
   dplyr::mutate(component = norm_component(component)) %>%
   dplyr::left_join(rm_init_tbl_r1 %>% dplyr::select(component, init_units), by="component") %>%
-  dplyr::mutate(units = dplyr::coalesce(init_units, 0)) %>%
+  dplyr::mutate(units = dplyr::coalesce(init_units, units, 0)) %>%
   dplyr::select(component, units)
 
 # dùng round1 state này cho optuna/engine
@@ -2984,7 +2984,7 @@ study <- optuna$create_study(
   sampler = optuna$samplers$TPESampler(seed=as.integer(42))
 )
 
-study$optimize(objective_py, n_trials = 1000)
+study$optimize(objective_py, n_trials = 100)
 
 best <- study$best_trial
 best$value
