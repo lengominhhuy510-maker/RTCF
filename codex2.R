@@ -2468,6 +2468,7 @@ out_base <- engine_round(
   exogenous = exo,
   n_weeks = 26
 )
+
 # =========================
 # 9) RUN PHASE 2 keep it real:))
 # =========================
@@ -2518,8 +2519,9 @@ if (enable_auto_assortment_round1) {
     decisions_round$sales$assortment_cp <- assortment_cp
   }
 # =========================
-# 9.2) PATCH OPENING INVENTORY FOR ROUND 1 (W -> units)
+# 8.5) CARRYOVER REAL STATE + OVERRIDE OPENING INVENTORY ROUND 1 (W1 -> units)
 # =========================
+
 rm_w1 <- c(
   "pack"      = 6.81,
   "pet"       = 3.86,
@@ -2537,21 +2539,27 @@ fg_w1 <- c(
   "Fressie Orange/Mango PET"        = 3.19
 )
 
-# 0) start from same empty-schema state (or carry state_end if you prefer)
-state0_round1 <- state0_round0
-state0_round1$rm_pipeline <- tibble::tibble(
-  week_order = integer(),
-  component  = character(),
-  vendor     = character(),
-  order_qty_units = double(),
-  purchase_price  = double(),
-  purchase_cost_total = double(),
-  eta_week   = integer()
-)
-state0_round1$prod_frozen_pipeline <- tibble::tibble()
-state0_round1$fg_next_prod <- init_fg_next_prod
+# (0) carryover thật từ round0 end-state
+state0_round1 <- out_base$state_end
 
-# 1) demand week1 must use ROUND1 assortment already set in decisions_round$sales$assortment_cp
+# (0.1) rebase pipeline weeks về round1 (nếu pipeline còn)
+if (!is.null(state0_round1$rm_pipeline) && nrow(state0_round1$rm_pipeline) > 0) {
+  state0_round1$rm_pipeline <- state0_round1$rm_pipeline %>%
+    dplyr::mutate(
+      eta_week   = eta_week - 26L,
+      week_order = week_order - 26L
+    ) %>%
+    dplyr::filter(eta_week >= 1L)
+}
+
+# (0.2) rebase frozen pipeline (nếu có)
+if (!is.null(state0_round1$prod_frozen_pipeline) && nrow(state0_round1$prod_frozen_pipeline) > 0) {
+  state0_round1$prod_frozen_pipeline <- state0_round1$prod_frozen_pipeline %>%
+    dplyr::mutate(week = week - 26L) %>%
+    dplyr::filter(week >= 1L)
+}
+
+# (1) demand week1 của round1 (PHẢI dùng assortment round1 đã chốt)
 demand_w1_r1 <- sales_demand_week(
   week = 1,
   state = state0_round1,
@@ -2566,7 +2574,7 @@ demand_sku_w1_r1 <- demand_w1_r1 %>%
   dplyr::summarise(demand_units = sum(demand_units, na.rm=TRUE), .groups="drop") %>%
   dplyr::mutate(sku = stringr::str_squish(sku))
 
-# 2) FG opening (weeks -> units)
+# (2) FG opening: weeks -> units
 fg_init_tbl_r1 <- tibble::tibble(
   sku = names(fg_w1),
   fg_weeks = as.numeric(fg_w1)
@@ -2575,7 +2583,7 @@ fg_init_tbl_r1 <- tibble::tibble(
   dplyr::left_join(demand_sku_w1_r1, by="sku") %>%
   dplyr::mutate(
     demand_units = dplyr::coalesce(demand_units, 0),
-    init_units = fg_weeks * demand_units
+    init_units   = fg_weeks * demand_units
   )
 
 state0_round1$fg_stock <- state0_round1$fg_stock %>%
@@ -2587,7 +2595,7 @@ state0_round1$fg_stock <- state0_round1$fg_stock %>%
   ) %>%
   dplyr::select(sku, units, age_w, obsolete_units)
 
-# 3) RM opening (weeks -> units) using BOM + sku demand week1
+# (3) RM opening: weeks -> units (dựa demand week1 + BOM)
 bom_long_r1 <- df_sku %>%
   dplyr::select(sku, starts_with("rm_")) %>%
   tidyr::pivot_longer(starts_with("rm_"), names_to="component_raw", values_to="qty_per_unit") %>%
@@ -2612,13 +2620,13 @@ rm_need_w1_r1 <- demand_sku_w1_r1 %>%
 
 rm_init_tbl_r1 <- tibble::tibble(
   component = names(rm_w1),
-  rm_weeks = as.numeric(rm_w1)
+  rm_weeks  = as.numeric(rm_w1)
 ) %>%
   dplyr::mutate(component = norm_component(component)) %>%
   dplyr::left_join(rm_need_w1_r1, by="component") %>%
   dplyr::mutate(
     rm_week_need = dplyr::coalesce(rm_week_need, 0),
-    init_units = rm_weeks * rm_week_need
+    init_units   = rm_weeks * rm_week_need
   )
 
 state0_round1$rm_stock <- state0_round1$rm_stock %>%
@@ -2627,7 +2635,9 @@ state0_round1$rm_stock <- state0_round1$rm_stock %>%
   dplyr::mutate(units = dplyr::coalesce(init_units, 0)) %>%
   dplyr::select(component, units)
 
-# IMPORTANT: from here on, use state0_round1 for Phase 3 / Optuna
+# dùng round1 state này cho optuna/engine
+state0_round <- state0_round1
+##-----
 
 # =========================
 # Phase 3 
