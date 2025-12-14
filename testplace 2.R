@@ -303,7 +303,25 @@ finance_constants <- list(
   ),
   investment=list(building_fixed=2500000)
 )
+##codex test
+# Aggregate global constants/lookups to avoid missing-object errors when running the script
+constants <- list(
+  operations = operations_constants,
+  purchasing = purchasing_constants,
+  supply_chain = sc_constants,
+  sales = sales_constants,
+  finance = finance_constants
+)
 
+lookups <- list(
+  df_component = df_component,
+  df_sku = df_sku,
+  CIsale_lookup = CIsale_lookup,
+  CIpur_lookup = CIpur_lookup,
+  sales_area_cp = sales_area_cp
+)
+
+exo <- list(volume_factor = NULL)
 # =========================
 # 3) HELPERS
 # =========================
@@ -637,8 +655,8 @@ rm_warehouse_week <- function(week, state, lookups, operations_constants,
   )
 }
 ##update helper admin beta 0.0.7
-admin_cost_week <- function(week, orders_w, sales_exec_w, purchasing_constants){
-  # Đảm bảo luôn có đầy đủ key cost, nếu thiếu thì mặc định =0 để tránh NA/NULL
+admin_cost_week <- function(week, orders_w, sales_exec_w, purchasing_constants, df_component){
+  
   logi_defaults <- list(
     drum_liters = 250,
     ibc_liters = 1000,
@@ -646,14 +664,10 @@ admin_cost_week <- function(week, orders_w, sales_exec_w, purchasing_constants){
     pallets_per_ftl = 30,
     admin_pct = 0.105
   )
-  
   logi <- modifyList(logi_defaults, purchasing_constants$logistics %||% list())
   
-  # Thông tin nhà cung cấp (cost per shipment/pallet/FTL)
-  sup_master <- purchasing_constants$supplier_master %>%
-    rename(vendor = supplier)
+  sup_master <- purchasing_constants$supplier_master %>% rename(vendor = supplier)
   
-  # Nếu không có order nào tuần này thì cost = 0
   if (is.null(orders_w) || nrow(orders_w) == 0){
     return(tibble(
       week = week,
@@ -667,50 +681,76 @@ admin_cost_week <- function(week, orders_w, sales_exec_w, purchasing_constants){
     ))
   }
   
+  # ---- Build units_per_pallet from df_component$pallet_qty (game-like)
+  stopifnot(all(c("component","pallet_qty") %in% names(df_component)))
+  
+  comp_pallet_tbl <- df_component %>%
+    transmute(
+      component_key = norm_component(component),     # pack_1_liter, pet, ...
+      units_per_pallet = as.numeric(pallet_qty)
+    )
+  
   orders_ext <- orders_w %>%
-    mutate(trade_unit = stringr::str_to_lower(replace_na(trade_unit, "pallet"))) %>%
+    mutate(
+      component = norm_component(component),         # pack, pet, orange...
+      trade_unit = str_to_lower(replace_na(trade_unit, "pallet")),
+      # map pack -> pack_1_liter để match df_component
+      component_key = ifelse(component == "pack", "pack_1_liter", component)
+    ) %>%
+    left_join(comp_pallet_tbl, by = "component_key") %>%
     left_join(sup_master, by = "vendor") %>%
     mutate(
-      trade_size_units = dplyr::case_when(
+      # trade size
+      trade_size_units = case_when(
         trade_unit == "drum" ~ logi$drum_liters,
-        trade_unit == "ibc" ~ logi$ibc_liters,
+        trade_unit == "ibc"  ~ logi$ibc_liters,
         trade_unit %in% c("tank", "tanktruck") ~ logi$tanktruck_liters,
-        trade_unit == "ftl" ~ logi$pallets_per_ftl,
+        trade_unit == "ftl"  ~ logi$pallets_per_ftl,
+        trade_unit == "pallet" ~ units_per_pallet,
         TRUE ~ 1
-      ),
-      # số shipment (ceil) dựa trên trade unit kích thước chuẩn
-      shipments = dplyr::case_when(
+      )
+    )
+  
+  # ---- TRIỆT ĐỂ: nếu trade_unit pallet mà thiếu pallet_qty => stop ngay
+  bad_pallet <- orders_ext %>%
+    filter(trade_unit == "pallet" & (is.na(trade_size_units) | trade_size_units <= 0))
+  
+  if (nrow(bad_pallet) > 0){
+    msg <- bad_pallet %>%
+      transmute(vendor, component, component_key, trade_unit) %>%
+      distinct() %>%
+      paste(capture.output(print(.)), collapse = "\n")
+    
+    stop(
+      "admin_cost_week: Missing/invalid df_component$pallet_qty for PALLET trade_unit.\n",
+      "Fix by filling df_component$pallet_qty for these components:\n", msg,
+      call. = FALSE
+    )
+  }
+  
+  orders_ext <- orders_ext %>%
+    mutate(
+      shipments = case_when(
         order_qty_units <= 0 | is.na(order_qty_units) ~ 0,
         TRUE ~ ceiling(order_qty_units / trade_size_units)
       ),
-      # cost base: pallet hoặc FTL tùy trade_unit
-      per_ship_cost = dplyr::case_when(
+      transport_rate = case_when(
         trade_unit %in% c("tank", "tanktruck", "ftl") ~ coalesce(transport_cost_per_ftl, 0),
         TRUE ~ coalesce(transport_cost_per_pallet, 0)
-      ) + coalesce(shipment_cost, 0),
-      transport_cost = shipments * per_ship_cost,
+      ),
+      transport_cost = shipments * transport_rate + coalesce(shipment_cost, 0),
       admin_surcharge = transport_cost * logi$admin_pct
     )
   
-  inbound_orders <- orders_ext %>% distinct(vendor, week) %>% nrow()
-  
-  inbound_orderlines <- nrow(orders_ext)
-  
-  outbound_orders     <- sales_exec_w %>% distinct(customer, week) %>% nrow()
-  outbound_orderlines <- nrow(sales_exec_w)
-  
-  transport_total <- sum(orders_ext$transport_cost, na.rm = TRUE)
-  admin_total <- sum(orders_ext$admin_surcharge, na.rm = TRUE)
-  
   tibble(
     week = week,
-    inbound_orders = inbound_orders,
-    inbound_orderlines = inbound_orderlines,
-    outbound_orders = outbound_orders,
-    outbound_orderlines = outbound_orderlines,
-    transport_cost = transport_total,
-    admin_surcharge = admin_total,
-    admin_cost = transport_total + admin_total
+    inbound_orders = orders_ext %>% distinct(vendor, week) %>% nrow(),
+    inbound_orderlines = nrow(orders_ext),
+    outbound_orders     = sales_exec_w %>% distinct(customer, week) %>% nrow(),
+    outbound_orderlines = nrow(sales_exec_w),
+    transport_cost = sum(orders_ext$transport_cost, na.rm = TRUE),
+    admin_surcharge = sum(orders_ext$admin_surcharge, na.rm = TRUE),
+    admin_cost = sum(orders_ext$transport_cost, na.rm = TRUE) + sum(orders_ext$admin_surcharge, na.rm = TRUE)
   )
 }
 ##Decision knob shortage rule #update beta 0.0.9
@@ -2120,7 +2160,7 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
     flows$purchasing_receipts <- bind_rows(flows$purchasing_receipts, rm_rep$receipts_w)#update beta 0.0.8
     flows$distribution <- bind_rows(##update beta 0.0.7
       flows$distribution,
-      admin_cost_week(w, rm_rep$orders, sales_exec, constants$purchasing)
+      admin_cost_week(w, rm_rep$orders, sales_exec, constants$purchasing, df_component = lookups$df_component)
     )
     flows$pi <- bind_rows(flows$pi, pi_kpi_w) ##Update beta 0.1.0
     flows$warehousing <- bind_rows(
