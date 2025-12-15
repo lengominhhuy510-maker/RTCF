@@ -687,7 +687,7 @@ admin_cost_week <- function(week, orders_w, sales_exec_w, purchasing_constants, 
   comp_pallet_tbl <- df_component %>%
     transmute(
       component_key = norm_component(component),     # pack_1_liter, pet, ...
-      units_per_pallet = as.numeric(pallet_qty)
+      units_per_pallet = as.numeric(readr::parse_number(as.character(pallet_qty)))
     )
   
   orders_ext <- orders_w %>%
@@ -1433,7 +1433,7 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
         component == "vitaminc"   ~ "vitamin_c",
         TRUE ~ component
       ),
-      component = norm_component(component)
+      component_key = norm_component(component)
     ) %>%
     select(sku, component, qty_per_unit)
   
@@ -1483,14 +1483,17 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
   #enforce trade unit multiple (InfoCenter)
   comp_pallet <- df_component %>%
     transmute(
-      component = norm_component(component),
-      units_per_pallet = as.numeric(pallet_qty)
+      component_key = norm_component(component),
+      units_per_pallet = as.numeric(readr::parse_number(na_if(as.character(pallet_qty), "-")))
     )
   logi_const <- sc_constants$logistics %||% list(
     drum_liters=250, ibc_liters=1000, tanktruck_liters=30000
   )
   
-  reorder_tbl <- reorder_tbl %>% left_join(comp_pallet, by = "component") %>%
+  reorder_tbl <- reorder_tbl %>%
+    mutate(component_key = ifelse(component == "pack", "pack_1_liter", component),
+           component_key = norm_component(component_key)) %>%
+    left_join(comp_pallet, by = "component_key") %>%
     mutate(
       trade_size_units = case_when(
         trade_unit == "drum" ~ logi_const$drum_liters,
@@ -1508,10 +1511,11 @@ rm_replenishment_week <- function(week, state, plan_w, decisions_sc,
     )
   
   #price & cost
-  reorder_tbl <- reorder_tbl %>%###sos
-    mutate(component_key = ifelse(component == "pack", "pack_1_liter", component))
   reorder_tbl <- reorder_tbl %>%
-    left_join(df_component %>% select(component, basic_price), by="component") %>%
+    left_join(df_component %>%##sos
+                transmute(component_key = norm_component(component),
+                          basic_price = as.numeric(readr::parse_number(as.character(basic_price)))),
+              by="component_key") %>%
     mutate(
       basic_price = replace_na(basic_price, 0),
       ci_purch=replace_na(ci_purch,1),
@@ -1850,7 +1854,7 @@ fulfill_demand_week <- function(week, state, demand_w, produced_w, df_sku,
       df_component %>%
         transmute(
           pack_component_key = norm_component(component),
-          pallet_qty = as.numeric(pallet_qty)
+          pallet_qty = as.numeric(readr::parse_number(as.character(pallet_qty)))
         ),
       by = "pack_component_key"
     ) %>%
