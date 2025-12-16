@@ -338,41 +338,53 @@ exo <- list(volume_factor = NULL)
 # =========================
 # 3) HELPERS
 # =========================
-##--
+##--16/12
 pallet_equiv_shipped <- function(units, trade_unit,
                                  units_per_pallet,
                                  units_per_layer = NA_real_,
                                  units_per_box   = NA_real_) {
-  tu <- norm_trade_unit(trade_unit)
+  # chuẩn hoá độ dài
+  n <- length(units)
+  units            <- as.numeric(units)
+  trade_unit       <- norm_trade_unit(trade_unit)
+  units_per_pallet <- as.numeric(units_per_pallet)
+  units_per_layer  <- as.numeric(units_per_layer)
+  units_per_box    <- as.numeric(units_per_box)
   
-  # safety
-  if (is.na(units) || units <= 0) return(0)
-  if (is.na(units_per_pallet) || units_per_pallet <= 0) return(0)
+  units[is.na(units)]                       <- 0
+  units_per_pallet[is.na(units_per_pallet)] <- 0
   
-  # fallback: nếu thiếu layer/box thì coi như ship pallet-equivalent theo pallet
-  if (is.na(units_per_layer) || units_per_layer <= 0) units_per_layer <- units_per_pallet
-  if (is.na(units_per_box)   || units_per_box   <= 0) units_per_box   <- units_per_pallet
+  # fallback layer/box = pallet nếu thiếu
+  units_per_layer[is.na(units_per_layer) | units_per_layer <= 0] <- units_per_pallet[is.na(units_per_layer) | units_per_layer <= 0]
+  units_per_box[is.na(units_per_box) | units_per_box <= 0]       <- units_per_pallet[is.na(units_per_box) | units_per_box <= 0]
   
-  # CEIL theo đơn vị trade_unit -> tạo hiệu ứng “inefficiency rounding”
-  if (tu == "pallet") {
-    pallets <- ceiling(units / units_per_pallet)
-    return(as.numeric(pallets))
-  }
+  res <- numeric(n)
   
-  if (tu == "pallet_layer") {
-    layers  <- ceiling(units / units_per_layer)
-    pallets <- layers * units_per_layer / units_per_pallet
-    return(as.numeric(pallets))
-  }
+  # những dòng invalid (0 hoặc thiếu pallet info) → 0 pallet
+  invalid <- units <= 0 | units_per_pallet <= 0
+  res[invalid] <- 0
   
-  if (tu == "outer_box") {
-    boxes   <- ceiling(units / units_per_box)
-    pallets <- boxes * units_per_box / units_per_pallet
-    return(as.numeric(pallets))
-  }
+  ok <- !invalid
   
-  # unknown unit -> fallback
-  as.numeric(units / units_per_pallet)
+  # pallet
+  idx_pallet <- ok & trade_unit == "pallet"
+  res[idx_pallet] <- ceiling(units[idx_pallet] / units_per_pallet[idx_pallet])
+  
+  # pallet_layer
+  idx_layer <- ok & trade_unit == "pallet_layer"
+  res[idx_layer] <- ceiling(units[idx_layer] / units_per_layer[idx_layer]) *
+    units_per_layer[idx_layer] / units_per_pallet[idx_layer]
+  
+  # outer_box
+  idx_box <- ok & trade_unit == "outer_box"
+  res[idx_box] <- ceiling(units[idx_box] / units_per_box[idx_box]) *
+    units_per_box[idx_box] / units_per_pallet[idx_box]
+  
+  # fallback: trade_unit khác
+  idx_other <- ok & !(trade_unit %in% c("pallet","pallet_layer","outer_box"))
+  res[idx_other] <- units[idx_other] / units_per_pallet[idx_other]
+  
+  as.numeric(res)
 }
 ##--
 calc_distribution_cost <- function(pallets_shipped, dc="DC Netherlands", finance_constants){
