@@ -1850,20 +1850,27 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
   startup_loss_pct <- op_const$startup_loss_pct %||% 0.10
   hours_required <- hours_required / (1 - startup_loss_pct)
   
-  ##--16/12
-  # shifts -> internal capacity theo ca (UI control)
-  num_shifts <- decisions_ops$num_shifts %||% 1L
-  available_hours_shift <- op_const$shift_hours[as.character(num_shifts)]
+  # shifts -> giới hạn nội bộ theo ca
+  num_shifts <- decisions_ops$num_shifts %||% 1
+  shift_hours_tbl <- op_const$shift_hours
+  available_hours_shift <- shift_hours_tbl[as.character(num_shifts)]
   available_hours_shift <- ifelse(is.na(available_hours_shift), 40, available_hours_shift)
- # internal cap theo game + theo shift
+  # FTE capacity (40h/FTE)
+  n_fte <- decisions_ops$n_fte_bottling %||% op_const$n_operators
+  fte_cap_hours <- n_fte * labor_const$fte_hours_per_week  # 40h/FTE * n_fte
+  # max internal hours theo game
   max_int_hours <- labor_const$max_internal_hours %||% 168
-  internal_cap_hours <- pmin(max_int_hours, available_hours_shift)
-  
-  internal_hours_total <- pmin(hours_required, internal_cap_hours)
-  outsourced_hours     <- pmax(0, hours_required - internal_cap_hours)
-  
+  # split hours
+  internal_fte_hours  <- pmin(hours_required, fte_cap_hours)
+  internal_flex_hours <- pmin(
+    pmax(0, hours_required - fte_cap_hours),
+    pmax(0, max_int_hours - fte_cap_hours)
+  )
+  outsourced_hours <- pmax(0, hours_required - max_int_hours)
+  # internal hours không vượt shift capacity
+  internal_hours_total <- internal_fte_hours + internal_flex_hours
+  internal_hours_total <- pmin(internal_hours_total, available_hours_shift)
   outsource_pct <- ifelse(hours_required > 0, outsourced_hours / hours_required, 0)
-  #--
   produced <- plan_after_mixer %>%
     transmute(
       week=week, sku,
@@ -1883,13 +1890,13 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
     mutate(week=week)
   
   #costs
-  ##16/12
-  operator_cost_per_hour_one <- op_const$operator_cost_per_year / (52 * labor_const$fte_hours_per_week)
-  cost_per_hour_line <- operator_cost_per_hour_one * op_const$n_operators  # FIXED 5 operators
-  
-  bottling_internal_cost  <- internal_hours_total * cost_per_hour_line
-  bottling_outsource_cost <- outsourced_hours * labor_const$flex_cost_per_hour * labor_const$outsourcing_factor
-  #--
+  fte_cost_per_hour_one  <- op_const$operator_cost_per_year / (52 * labor_const$fte_hours_per_week)
+  fte_cost_per_hour_line <- fte_cost_per_hour_one * n_fte
+  fte_cost  <- internal_fte_hours  * fte_cost_per_hour_line
+  flex_cost <- internal_flex_hours * labor_const$flex_cost_per_hour
+  out_cost  <- outsourced_hours    * labor_const$flex_cost_per_hour * labor_const$outsourcing_factor
+  bottling_internal_cost  <- fte_cost + flex_cost
+  bottling_outsource_cost <- out_cost
   bottling_fixed_week     <- op_const$fixed_annual_cost / 52
   
   #mixer cost
