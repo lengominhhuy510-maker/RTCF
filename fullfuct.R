@@ -1902,34 +1902,52 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
   if (is.null(bottling_rate_lph) || bottling_rate_lph <= 0) bottling_rate_lph <- 3100
   
   ##16/12
-  runtime_hours <- sum(plan_after_mixer$liters_after_mixer, na.rm=TRUE) / bottling_rate_lph
-  startup_loss_pct <- op_const_adj$startup_loss_pct %||% 0.10
-  runtime_hours <- runtime_hours / (1 - startup_loss_pct)
+  # Base hours required on the line (no preventive/breakdown), including startup loss
+  base_hours_required <- sum(plan_after_mixer$liters_after_mixer, na.rm = TRUE) / bottling_rate_lph
+  startup_loss_pct    <- op_const_adj$startup_loss_pct %||% 0.10
+  base_hours_required <- base_hours_required / (1 - startup_loss_pct)
+  
+  # Keep runtime_hours as KPI (same as base)
+  runtime_hours <- base_hours_required
   
   preventive_mode <- decisions_ops$preventive_maintenance %||% "none"
-  preventive_hours <- case_when(
-    preventive_mode == "minimal" ~ (prog_const$preventive_hours$minimal %||% 0),
-    preventive_mode == "extensive" ~ (prog_const$preventive_hours$extensive %||% 0),
-    TRUE ~ 0
-  )
+  any_program_on <- (preventive_mode != "none") ||
+    isTRUE(decisions_ops$rm_inspection_on) ||
+    isTRUE(decisions_ops$breakdown_training_on) ||
+    isTRUE(decisions_ops$speed_optimization_on) ||
+    isTRUE(decisions_ops$smed_on)
   
-  breakdown_rate <- op_const_adj$base_breakdown_rate %||% 0.10
-  breakdown_rate <- case_when(
-    preventive_mode == "minimal" ~ breakdown_rate * (prog_const$preventive_rate_reduction$minimal %||% 1),
-    preventive_mode == "extensive" ~ breakdown_rate * (prog_const$preventive_rate_reduction$extensive %||% 1),
-    TRUE ~ breakdown_rate
-  )
-  
-  if (isTRUE(decisions_ops$rm_inspection_on)) {
-    breakdown_rate <- breakdown_rate * (operations_constants$raw_material_inspection$reduce_breakdowns_factor %||% 1)
+  if (!any_program_on) {
+    # === All programs OFF -> keep old baseline behaviour ===
+    preventive_hours <- 0
+    breakdown_hours  <- 0
+    hours_required   <- base_hours_required
+  } else {
+    # === At least one program ON -> apply advanced breakdown/preventive logic ===
+    
+    preventive_hours <- dplyr::case_when(
+      preventive_mode == "minimal"   ~ (prog_const$preventive_hours$minimal  %||% 0),
+      preventive_mode == "extensive" ~ (prog_const$preventive_hours$extensive %||% 0),
+      TRUE                           ~ 0
+    )
+    
+    breakdown_rate <- op_const_adj$base_breakdown_rate %||% 0.10
+    breakdown_rate <- dplyr::case_when(
+      preventive_mode == "minimal"   ~ breakdown_rate * (prog_const$preventive_rate_reduction$minimal  %||% 1),
+      preventive_mode == "extensive" ~ breakdown_rate * (prog_const$preventive_rate_reduction$extensive %||% 1),
+      TRUE                           ~ breakdown_rate
+    )
+    
+    if (isTRUE(decisions_ops$rm_inspection_on)) {
+      breakdown_rate <- breakdown_rate * (operations_constants$raw_material_inspection$reduce_breakdowns_factor %||% 1)
+    }
+    if (isTRUE(decisions_ops$breakdown_training_on)) {
+      breakdown_rate <- breakdown_rate * (prog_const$training_breakdown_reduction %||% 1)
+    }
+    
+    breakdown_hours <- base_hours_required * breakdown_rate
+    hours_required  <- base_hours_required + preventive_hours + breakdown_hours
   }
-  if (isTRUE(decisions_ops$breakdown_training_on)) {
-    breakdown_rate <- breakdown_rate * (prog_const$training_breakdown_reduction %||% 1)
-  }
-  
-  breakdown_hours <- runtime_hours * breakdown_rate
-  hours_required <- runtime_hours + preventive_hours + breakdown_hours
-  
   ##--
   
   # shifts -> giới hạn nội bộ theo ca
