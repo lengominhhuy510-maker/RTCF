@@ -167,7 +167,7 @@ operations_constants <- list(
     size_changeover_hours    = 4.0,##
     startup_loss_hours = 0.1,
     investment_cost = 490000,             # <<< Swiss Fill 2 investment
-    base_breakdown_rate = NULL,
+    base_breakdown_rate = 0.10,
     breakdown_hours_loss = NULL,
     packaging_quality_sensitivity = NULL
   ),
@@ -210,6 +210,16 @@ operations_constants <- list(
   raw_material_inspection=list(
     add_hours_per_orderline=2,
     reduce_breakdowns_factor=0.6
+  ),
+  programs = list(##16/12
+    preventive_hours = list(minimal = 1, extensive = 3),
+    preventive_rate_reduction = list(minimal = 0.7, extensive = 0.5),
+    training_breakdown_reduction = 0.6, # 40% reduction in duration
+    training_cost_per_employee = 400,
+    speed_gain_pct = 0.10,
+    speed_optimization_cost_year = 30000,
+    smed_changeover_reduction = 0.7,
+    smed_cost_year = 20000
   ),
   time=list(week_days=5, hours_per_day=8)
 )
@@ -668,11 +678,11 @@ rm_warehouse_week <- function(week, state, lookups, operations_constants,
       )
     
     # nếu pallet NA (pack/PET) thì fallback sang units_per_pallet nếu có
+   ##18/12
     if ("units_per_pallet" %in% names(df_comp)){
       rm_stock_tbl <- rm_stock_tbl %>%
         left_join(df_comp %>% select(component, units_per_pallet), by="component") %>%
         mutate(
-          units_per_pallet = replace_na(units_per_pallet, NA_real_),
           pallets = ifelse(
             is.na(pallets),
             ifelse(is.na(units_per_pallet) | units_per_pallet<=0, 0, units/units_per_pallet),
@@ -739,10 +749,9 @@ rm_warehouse_week <- function(week, state, lookups, operations_constants,
       )
     
     if ("units_per_pallet" %in% names(df_comp)){
-      tmp_rec <- tmp_rec %>%
+      tmp_rec %>%
         left_join(df_comp %>% select(component, units_per_pallet), by="component") %>%
         mutate(
-          units_per_pallet = replace_na(units_per_pallet, NA_real_),
           pallets = ifelse(
             is.na(pallets),
             ifelse(is.na(units_per_pallet) | units_per_pallet<=0, 0, received_qty_units/units_per_pallet),
@@ -965,11 +974,17 @@ pi_tool_predict_week <- function(week, demand_w, decisions_sc, df_sku,plan_w,pro
                                  decisions_ops, sc_constants){
   
   op_const <- operations_constants$bottling_line
+  prog_const <- operations_constants$programs %||% list()##16/12
   cap_lph  <- op_const$capacity_lph
+  if (isTRUE(decisions_ops$speed_optimization_on)) {
+    cap_lph <- cap_lph * (1 + (prog_const$speed_gain_pct %||% 0.10))
+  }
   f_co_h   <- op_const$formula_changeover_hours
   s_co_h   <- op_const$size_changeover_hours
   su_h     <- op_const$startup_loss_hours
-  
+  smed_factor <- if (isTRUE(decisions_ops$smed_on)) (prog_const$smed_changeover_reduction %||% 0.7) else 1
+  f_co_h <- f_co_h * smed_factor
+  s_co_h <- s_co_h * smed_factor##16/12
   operator_cost_per_hour_one  <- op_const$operator_cost_per_year / (52 * op_const$operator_hours_per_week)
   cost_per_hour_line <- operator_cost_per_hour_one * op_const$n_operators
   
@@ -1026,11 +1041,43 @@ pi_tool_predict_week <- function(week, demand_w, decisions_sc, df_sku,plan_w,pro
   changeover_costs_year<- (co_formula_hours + co_size_hours) * cost_per_hour_line * 52
   
   total_time_hours <- runtime_hours + co_formula_hours + co_size_hours + startup_hours
+  ##16/12
+  preventive_mode <- decisions_ops$preventive_maintenance %||% "none"
+  preventive_hours <- case_when(
+    preventive_mode == "minimal" ~ (prog_const$preventive_hours$minimal %||% 0),
+    preventive_mode == "extensive" ~ (prog_const$preventive_hours$extensive %||% 0),
+    TRUE ~ 0
+  )
   
+  breakdown_rate <- op_const$base_breakdown_rate %||% 0.10
+  breakdown_rate <- case_when(
+    preventive_mode == "minimal" ~ breakdown_rate * (prog_const$preventive_rate_reduction$minimal %||% 1),
+    preventive_mode == "extensive" ~ breakdown_rate * (prog_const$preventive_rate_reduction$extensive %||% 1),
+    TRUE ~ breakdown_rate
+  )
+  
+  if (isTRUE(decisions_ops$rm_inspection_on)) {
+    breakdown_rate <- breakdown_rate * (operations_constants$raw_material_inspection$reduce_breakdowns_factor %||% 1)
+  }
+  if (isTRUE(decisions_ops$breakdown_training_on)) {
+    breakdown_rate <- breakdown_rate * (prog_const$training_breakdown_reduction %||% 1)
+  }
+  
+  breakdown_hours <- total_time_hours * breakdown_rate
+  total_time_hours <- total_time_hours + preventive_hours + breakdown_hours##16/12
   num_shifts <- decisions_ops$num_shifts %||% 1
   available_hours <- op_const$shift_hours[as.character(num_shifts)]
   available_hours <- ifelse(is.na(available_hours), 40, available_hours)
+  ##16/12
+  training_cost_year <- if (isTRUE(decisions_ops$breakdown_training_on)) {
+    n_emp <- decisions_ops$n_fte_bottling %||% op_const$n_operators
+    (prog_const$training_cost_per_employee %||% 0) * n_emp
+  } else {0}
+  speed_cost_year <- if (isTRUE(decisions_ops$speed_optimization_on)) (prog_const$speed_optimization_cost_year %||% 0) else 0
+  smed_cost_year  <- if (isTRUE(decisions_ops$smed_on)) (prog_const$smed_cost_year %||% 0) else 0
+  program_cost_year <- training_cost_year + speed_cost_year + smed_cost_year
   
+  total_costs_year <- stock_costs_year + startup_cost_year + changeover_costs_year + program_cost_year##16/12
   utilization <- ifelse(available_hours>0, total_time_hours/available_hours, 0)
   
   tibble(
@@ -1041,8 +1088,11 @@ pi_tool_predict_week <- function(week, demand_w, decisions_sc, df_sku,plan_w,pro
     changeover_formula_hours = co_formula_hours,
     changeover_size_hours = co_size_hours,
     changeover_costs_year = changeover_costs_year,
-    total_costs_year = stock_costs_year + startup_cost_year + changeover_costs_year,
+    total_costs_year = total_costs_year,##16/12
     total_time_hours = total_time_hours,
+    preventive_hours = preventive_hours,##16/12
+    breakdown_hours = breakdown_hours,##16/12
+    program_cost_year = program_cost_year,##16/12
     utilization_rate = utilization,
     n_sku_run = n_sku_int_run,
     n_changeover = n_co
@@ -1834,21 +1884,70 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
   #~BOTTLING capacity + outsourcing
   op_const <- operations_constants$bottling_line
   labor_const <- operations_constants$labor_production
-  bottling_rate_lph <- op_const$capacity_lph
-  if (is.null(bottling_rate_lph) || bottling_rate_lph <= 0) bottling_rate_lph <- 3100
-  hours_required <- sum(plan_after_mixer$liters_after_mixer, na.rm=TRUE) / bottling_rate_lph
-  startup_loss_pct <- op_const$startup_loss_pct %||% 0.10
-  hours_required <- hours_required / (1 - startup_loss_pct)
-  ##Update 0.1.8 Add FTE effect
-  op_const   <- operations_constants$bottling_line
-  labor_const<- operations_constants$labor_production
+  ##16/12
+  prog_const <- operations_constants$programs %||% list()
   
-  bottling_rate_lph <- op_const$capacity_lph
+  op_const_adj <- op_const
+  if (isTRUE(decisions_ops$speed_optimization_on)) {
+    op_const_adj$capacity_lph <- op_const_adj$capacity_lph * (1 + (prog_const$speed_gain_pct %||% 0.10))
+  }
+  
+  smed_factor <- if (isTRUE(decisions_ops$smed_on)) (prog_const$smed_changeover_reduction %||% 0.7) else 1
+  op_const_adj$formula_changeover_hours <- op_const_adj$formula_changeover_hours * smed_factor
+  op_const_adj$size_changeover_hours    <- op_const_adj$size_changeover_hours * smed_factor
+  
+  bottling_rate_lph <- op_const_adj$capacity_lph
+  ##---
   if (is.null(bottling_rate_lph) || bottling_rate_lph <= 0) bottling_rate_lph <- 3100
   
-  hours_required <- sum(plan_after_mixer$liters_after_mixer, na.rm=TRUE) / bottling_rate_lph
-  startup_loss_pct <- op_const$startup_loss_pct %||% 0.10
-  hours_required <- hours_required / (1 - startup_loss_pct)
+  ##16/12
+  # Base hours required on the line (no preventive/breakdown), including startup loss
+  base_hours_required <- sum(plan_after_mixer$liters_after_mixer, na.rm = TRUE) / bottling_rate_lph
+  startup_loss_pct    <- op_const_adj$startup_loss_pct %||% 0.10
+  base_hours_required <- base_hours_required / (1 - startup_loss_pct)
+  
+  # Keep runtime_hours as KPI (same as base)
+  runtime_hours <- base_hours_required
+  
+  preventive_mode <- decisions_ops$preventive_maintenance %||% "none"
+  any_program_on <- (preventive_mode != "none") ||
+    isTRUE(decisions_ops$rm_inspection_on) ||
+    isTRUE(decisions_ops$breakdown_training_on) ||
+    isTRUE(decisions_ops$speed_optimization_on) ||
+    isTRUE(decisions_ops$smed_on)
+  
+  if (!any_program_on) {
+    # === All programs OFF -> keep old baseline behaviour ===
+    preventive_hours <- 0
+    breakdown_hours  <- 0
+    hours_required   <- base_hours_required
+  } else {
+    # === At least one program ON -> apply advanced breakdown/preventive logic ===
+    
+    preventive_hours <- dplyr::case_when(
+      preventive_mode == "minimal"   ~ (prog_const$preventive_hours$minimal  %||% 0),
+      preventive_mode == "extensive" ~ (prog_const$preventive_hours$extensive %||% 0),
+      TRUE                           ~ 0
+    )
+    
+    breakdown_rate <- op_const_adj$base_breakdown_rate %||% 0.10
+    breakdown_rate <- dplyr::case_when(
+      preventive_mode == "minimal"   ~ breakdown_rate * (prog_const$preventive_rate_reduction$minimal  %||% 1),
+      preventive_mode == "extensive" ~ breakdown_rate * (prog_const$preventive_rate_reduction$extensive %||% 1),
+      TRUE                           ~ breakdown_rate
+    )
+    
+    if (isTRUE(decisions_ops$rm_inspection_on)) {
+      breakdown_rate <- breakdown_rate * (operations_constants$raw_material_inspection$reduce_breakdowns_factor %||% 1)
+    }
+    if (isTRUE(decisions_ops$breakdown_training_on)) {
+      breakdown_rate <- breakdown_rate * (prog_const$training_breakdown_reduction %||% 1)
+    }
+    
+    breakdown_hours <- base_hours_required * breakdown_rate
+    hours_required  <- base_hours_required + preventive_hours + breakdown_hours
+  }
+  ##--
   
   # shifts -> giới hạn nội bộ theo ca
   num_shifts <- decisions_ops$num_shifts %||% 1
@@ -1902,11 +2001,25 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
   #mixer cost
   mixer_fixed_week <- mix_const$fixed_annual_cost / 52
   mixer_var_cost   <- mixer_hours_required * mix_const$variable_cost_per_hour
+  ##16/12
+  training_cost_week <- if (isTRUE(decisions_ops$breakdown_training_on)) {
+    n_emp <- decisions_ops$n_fte_bottling %||% op_const$n_operators
+    (prog_const$training_cost_per_employee %||% 0) * n_emp / 52
+  } else {0}
+  speed_cost_week <- if (isTRUE(decisions_ops$speed_optimization_on)) {
+    (prog_const$speed_optimization_cost_year %||% 0) / 52
+  } else {0}
+  smed_cost_week <- if (isTRUE(decisions_ops$smed_on)) {
+    (prog_const$smed_cost_year %||% 0) / 52
+  } else {0}
+  program_cost_week <- training_cost_week + speed_cost_week + smed_cost_week
+  ##--
   production_cost_total <- bottling_internal_cost +
     bottling_outsource_cost +
     bottling_fixed_week +
     mixer_fixed_week +
-    mixer_var_cost
+    mixer_var_cost+
+    program_cost_week
   # phân bổ cost theo liters
   #  Robust allocation per week (fix over-allocate) update beta 0.0.8
   produced <- produced %>%
@@ -1936,6 +2049,9 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
     week=week,
     ratio_rm=ratio_rm,
     ratio_mixer=ratio_mixer,
+    runtime_hours=runtime_hours,##16/12
+    preventive_hours=preventive_hours,##16/12
+    breakdown_hours=breakdown_hours,##16/12
     hours_required=hours_required,
     available_hours=available_hours_shift,
     internal_hours=internal_hours_total,
@@ -1944,6 +2060,7 @@ execute_production_week <- function(week, state, plan_w, rm_receipts_w, df_sku,#
     mixer_hours_required=mixer_hours_required,
     mixer_hours_available=mixer_hours_available,
     production_cost_total=production_cost_total,
+    program_cost_week = program_cost_week,##16/12
     idle_cost = idle_cost
   )
   list(production=produced, rm_used=rm_used, kpis=production_kpis)
@@ -2128,13 +2245,18 @@ finance_aggregate_round <- function(flows, finance_constants, operations_constan
       summarise(dist_costs = sum(dist_cost, na.rm = TRUE)) %>%
       pull(dist_costs)
   }
+  overhead_costs <-160000+30000+150000
   
-  operating_profit <- gross_margin - dist_costs
+  operating_profit <- gross_margin - dist_costs-overhead_costs
   
   # Gom CAPEX lại
-  investment_total <- finance_constants$investment$building_fixed +
+  fixed_investment <- finance_constants$investment$building_fixed +
     operations_constants$mixer$investment_cost +
     operations_constants$bottling_line$investment_cost
+  avg_rm_value <- mean(flows$inventory$rm_value_total, na.rm = TRUE)
+  avg_fg_value <- mean(flows$inventory$fg_value_total, na.rm = TRUE)
+  stock_investment <- avg_rm_value + avg_fg_value
+  investment_total <- fixed_investment + stock_investment+100000
   
   ROI_pred <- operating_profit / investment_total
   
@@ -2401,23 +2523,23 @@ engine_round <- function(state0, decisions, constants, lookups, exogenous, n_wee
 # 7) STATE0 + DECISIONS ROUND (PHASE 1 DEFAULT)
 # =========================
 #(1) Round0 SUPPLY CHAIN knobs (from decision log)
-rm_ss0  <- setNames(rep(2.0, 5), c("pack","pet","orange","mango","vitamin_c"))
-rm_lot0 <- setNames(rep(4L,  5), c("pack","pet","orange","mango","vitamin_c"))
+rm_ss0  <- setNames(c(1.37,4.75,2.33,2.08,3.14), c("pack","pet","orange","mango","vitamin_c"))
+rm_lot0 <- setNames(c(4L,8L,4L,4L,10L), c("pack","pet","orange","mango","vitamin_c"))
 
-fg_ss0  <- setNames(rep(3.0, length(unique(df_sku$sku))), unique(df_sku$sku))
+fg_ss0  <- setNames(rep(1.824, length(unique(df_sku$sku))), unique(df_sku$sku))
 fg_int0 <- setNames(rep(10L, length(unique(df_sku$sku))), unique(df_sku$sku))  # 10 days all SKUs
-frozen0 <- 3L
+frozen0 <- 1L
 
 # ---- (2) Round0 SALES agreement (from decision log)
 sales_customer_agreement0 <- tibble::tibble(
   customer = c("Food & Groceries","LAND Market","Dominick's"),
   promotional_pressure = "middle",
   promotion_horizon    = "short",
-  service_level        = 95,
+  service_level        = c(95.5,94.5,95.5),
   shelf_life           = "80",
   payment_term         = "4",
   order_deadline       = c("17pm","17pm","12pm"),
-  trade_unit           = c("pallet_layer","pallet_layer","pallet")
+  trade_unit           = c("pallet_layer","outer_box","outer_box")
 ) %>%
   dplyr::mutate(customer = norm_customer(customer))
 
@@ -2465,11 +2587,11 @@ shortage_rule0 <- "proportional"
 supplier_params_round0 <- tibble::tibble(
   component = c("pack","pet","orange","mango","vitamin_c"),
   vendor = c("Mono Packaging Materials","Trio PET PLC","Miami Oranges","NO8DO Mango","Seitan Vitamins"),
-  quality = c("high","poor","high","high","high"),
-  delivery_window = c("4hours","1day","1day","1day","1day"),
-  delivery_reliability = c(95, 94, 98, 96, 90),
+  quality = c("middle","poor","middle","poor","poor"),
+  delivery_window = c("2days","1day","1week","1day","1week"),
+  delivery_reliability = c(93, 97.5, 90, 95.5, 100),
   trade_unit = c("pallet","pallet","tank","ibc","drum"),
-  payment_term = c("4","4","4","4","6")
+  payment_term = c("4","4","4","4","4")
 ) %>%
   dplyr::mutate(
     component = norm_component(component),
@@ -2485,14 +2607,17 @@ supplier_params_round0 <- refresh_ci_purch(supplier_params_round0, CIpur_lookup)
 
 # ---- (5) Round0 OPERATIONS knobs (from decision log)
 ops_round0 <- list(
-  rm_pallet_locations = 900L,
-  fg_pallet_locations = 1500L,
-  n_fte_fg_wh = 4L,
-  n_fte_rm_wh = 5L,
-  num_shifts  = 2L,
+  rm_pallet_locations = 705L,
+  fg_pallet_locations = 1287L,
+  n_fte_fg_wh = 2L,
+  n_fte_rm_wh = 14L,
+  num_shifts  = 5L,
   # game UI không show n_fte_bottling; giữ baseline = 5 operators Swiss Fill 2
-  rm_inspection_on = FALSE
-)
+  rm_inspection_on = FALSE,
+  preventive_maintenance = "none",
+  breakdown_training_on = FALSE,
+  speed_optimization_on = FALSE,
+  smed_on = FALSE)
 
 # ---- (6) Assemble decisions_round0
 decisions_round0 <- list(
@@ -2519,20 +2644,20 @@ decisions_round0 <- list(
 # ============================================================
 
 rm_w0 <- c(
-  "pack"      = 4.28,
-  "pet"       = 2.58,
-  "orange"    = 0,
-  "mango"     = 5.01,
-  "vitamin_c" = 3.87
+  "pack"      = 6.81,
+  "pet"       = 3.86,
+  "orange"    = 7.05,
+  "mango"     = 4.79,
+  "vitamin_c" = 4.88
 )
 
 fg_w0 <- c(
-  "Fressie Orange 1 liter"          = 4.24,
-  "Fressie Orange/C-power 1 liter"  = 3.82,
-  "Fressie Orange/Mango 1 liter"    = 3.29,
-  "Fressie Orange PET"              = 4.65,
-  "Fressie Orange/C-power PET"      = 0,
-  "Fressie Orange/Mango PET"        = 3.29
+  "Fressie Orange 1 liter"          = 0.95,
+  "Fressie Orange/C-power 1 liter"  = 4.06,
+  "Fressie Orange/Mango 1 liter"    = 3.21,
+  "Fressie Orange PET"              = 4.57,
+  "Fressie Orange/C-power PET"      = 2.83,
+  "Fressie Orange/Mango PET"        = 3.19
 )
 # base empty state schema first (so we can call sales_demand_week)
 init_fg_next_prod <- tibble::tibble(
@@ -3064,6 +3189,10 @@ objective_r <- function(trial){
   n_fte_fg_wh         <- suggest_int_r(trial, "n_fte_fg_wh", 3L, 20L)
   num_shifts          <- suggest_int_r(trial, "num_shifts", 1L, 5L)
   rm_inspection_on    <- suggest_cat_r(trial, "rm_inspection_on", c(FALSE, TRUE))
+  preventive_maintenance <- suggest_cat_r(trial, "preventive_maintenance", c("none", "minimal", "extensive"))
+  breakdown_training_on  <- suggest_cat_r(trial, "breakdown_training_on", c(FALSE, TRUE))
+  speed_optimization_on  <- suggest_cat_r(trial, "speed_optimization_on", c(FALSE, TRUE))
+  smed_on                <- suggest_cat_r(trial, "smed_on", c(FALSE, TRUE))
   
   #(4) assemble decisions
   decisions_trial <- decisions_round
@@ -3091,6 +3220,10 @@ objective_r <- function(trial){
   decisions_trial$operations$num_shifts          <- num_shifts
   decisions_trial$operations$rm_inspection_on    <- rm_inspection_on
   decisions_trial$operations$n_fte_fg_wh         <- n_fte_fg_wh
+  decisions_trial$operations$preventive_maintenance <- preventive_maintenance
+  decisions_trial$operations$breakdown_training_on  <- breakdown_training_on
+  decisions_trial$operations$speed_optimization_on  <- speed_optimization_on
+  decisions_trial$operations$smed_on                <- smed_on
   # keep assortment fixed từ auto CM nếu muốn:
   # decisions_trial$sales$assortment_cp <- decisions_round$sales$assortment_cp
   
@@ -3229,6 +3362,14 @@ reconstruct_best_decisions <- function(
   rm_inspection_on <- best_params[["rm_inspection_on"]] %||%
     decisions_base$operations$rm_inspection_on
   n_fte_fg_wh <- best_params[["n_fte_fg_wh"]] %||% decisions_base$operations$n_fte_fg_wh
+  preventive_maintenance <- best_params[["preventive_maintenance"]] %||%
+    decisions_base$operations$preventive_maintenance %||% "none"
+  breakdown_training_on <- best_params[["breakdown_training_on"]] %||%
+    decisions_base$operations$breakdown_training_on %||% FALSE
+  speed_optimization_on <- best_params[["speed_optimization_on"]] %||%
+    decisions_base$operations$speed_optimization_on %||% FALSE
+  smed_on <- best_params[["smed_on"]] %||%
+    decisions_base$operations$smed_on %||% FALSE
   #4) Assemble decisions
   decisions_best <- decisions_base
   decisions_best$sales$customer_product_level <- sales_decision_best
@@ -3252,6 +3393,10 @@ reconstruct_best_decisions <- function(
   decisions_best$operations$num_shifts          <- as.integer(num_shifts)
   decisions_best$operations$rm_inspection_on    <- as.logical(rm_inspection_on)
   decisions_best$operations$n_fte_fg_wh         <- as.integer(n_fte_fg_wh)
+  decisions_best$operations$preventive_maintenance <- as.character(preventive_maintenance)
+  decisions_best$operations$breakdown_training_on  <- as.logical(breakdown_training_on)
+  decisions_best$operations$speed_optimization_on  <- as.logical(speed_optimization_on)
+  decisions_best$operations$smed_on                <- as.logical(smed_on)
   decisions_best
 }
 # =========================
