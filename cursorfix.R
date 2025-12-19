@@ -1376,7 +1376,7 @@ apply_sales_agreement_customer <- function(sales_decision_cp, CIsale_lookup, idx
     mutate(customer = norm_customer(customer),
            promotional_pressure = stringr::str_to_lower(promotional_pressure),
            promotion_horizon    = stringr::str_to_lower(promotion_horizon)) %>%
-    dplyr::filter(promotional_pressure == "middle",
+    dplyr::filter(
                   promotion_horizon    == "short") %>% ##ROUND 1 CONSTANT
     group_by(customer) %>%
     mutate(sale_idx = dplyr::row_number()) %>%
@@ -2801,14 +2801,7 @@ state0_round0$rm_stock <- state0_round0$rm_stock %>%
   dplyr::left_join(rm_init_tbl %>% dplyr::select(component, init_units), by="component") %>%
   dplyr::mutate(units = dplyr::coalesce(init_units, 0)) %>%
   dplyr::select(component, units)
-##19/12
-state0_round0$rm_stock <- state0_round0$rm_stock %>%
-  mutate(
-    component = norm_component(component),
-    component = ifelse(component == "pack_1_liter", "pack", component)
-  ) %>%
-  group_by(component) %>%
-  summarise(units = sum(units), .groups="drop")
+
 
 # (8) USE THESE AS YOUR BASELINE FOR ROUND 0
 state0_round  <- state0_round0
@@ -2916,7 +2909,11 @@ if (!is.null(state0_round1$prod_frozen_pipeline) && nrow(state0_round1$prod_froz
     dplyr::mutate(week = week - 26L) %>%
     dplyr::filter(week >= 1L)
 }
-
+# (0.3) rebase next production week (nếu có)
+if (!is.null(state0_round1$fg_next_prod) && nrow(state0_round1$fg_next_prod) > 0) {
+  state0_round1$fg_next_prod <- state0_round1$fg_next_prod %>%
+    dplyr::mutate(next_prod_week = pmax(1L, next_prod_week - 26L))
+}
 # (1) demand week1 của round1 (PHẢI dùng assortment round1 đã chốt)
 demand_w1_r1 <- sales_demand_week(
   week = 1,
@@ -3133,7 +3130,6 @@ objective_r <- function(trial){
     n_sale_cu <- CIsale_lookup %>%
       mutate(customer = norm_customer(customer)) %>%
       dplyr::filter(customer == cu_norm,
-                    promotional_pressure == "middle",
                     promotion_horizon    == "short") %>%##ROUND 1 CONSTANT
       nrow()
     
@@ -3450,7 +3446,7 @@ study <- optuna$create_study(
   sampler = optuna$samplers$TPESampler(seed=as.integer(42))
 )
 
-study$optimize(objective_py, n_trials = 10)
+study$optimize(objective_py, n_trials = 100)
 
 best <- study$best_trial
 best$value
