@@ -2829,7 +2829,7 @@ out_base$finance_round
 # chạy 1 vòng baseline để có sales history
 
 # auto assortment từ history vừa rồi
-enable_auto_assortment_round1 <- FALSE
+enable_auto_assortment_round1 <- TRUE
 assortment_cp <- decisions_round$sales$assortment_cp##codex2
 if (enable_auto_assortment_round1) {
   # auto assortment từ history vừa rồi
