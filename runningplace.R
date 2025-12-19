@@ -1367,7 +1367,7 @@ apply_sales_agreement_customer <- function(sales_decision_cp, CIsale_lookup, idx
     mutate(customer = norm_customer(customer),
            promotional_pressure = stringr::str_to_lower(promotional_pressure),
            promotion_horizon    = stringr::str_to_lower(promotion_horizon)) %>%
-    dplyr::filter(promotional_pressure == "middle",
+    dplyr::filter(
                   promotion_horizon    == "short") %>% ##ROUND 1 CONSTANT
     group_by(customer) %>%
     mutate(sale_idx = dplyr::row_number()) %>%
