@@ -679,7 +679,10 @@ sales_constants &lt;- list(
     slowmover_multiplier=2,
     uplift_method=&quot;midpoint&quot;
   ),
-  market_forces=list(volume_factor_min=0.90, volume_factor_max=1.10),
+  market_forces=list( volume_factor_min=0.90,
+    volume_factor_max=1.10,
+    value_for_money_multiplier=2,
+    slowmover_multiplier=2),
   shortage_rules=list(methods=c(&quot;proportional&quot;,&quot;fcfs&quot;,&quot;priority&quot;)),
   customer_master=customer_master,
   observed=list(benchmark_demand=benchmark_demand),
@@ -1551,7 +1554,7 @@ auto_assortment_phase3 &lt;- function(
   # nếu không có history =&gt; trả baseline luôn
   if (is.null(sales_exec_hist) || is.null(df_sku)) {
     out &lt;- base %&gt;%
-      transmute(customer, sku, active = base_active)
+      transmute(customer, sku, active = base_active, slowmover = FALSE)
     
     # apply prior override nếu có
     if (!is.null(assortment_prior) &amp;&amp; nrow(assortment_prior)&gt;0){
@@ -1559,7 +1562,7 @@ auto_assortment_phase3 &lt;- function(
         left_join(assortment_prior %&gt;% select(customer, sku, active_prior=active),
                   by=c(&quot;customer&quot;,&quot;sku&quot;)) %&gt;%
         mutate(active = ifelse(!is.na(active_prior), active_prior, active)) %&gt;%
-        select(customer, sku, active)
+        select(customer, sku, active, slowmover)
     }
     return(out)
   }
@@ -1697,7 +1700,7 @@ auto_assortment_phase3 &lt;- function(
       deactivate_loss = (!keep_core) &amp; cm_total_sum &lt;= 0 &amp; (margin_bad | sla_bad | slowmover),
       active_auto = base_active &amp; !deactivate_loss
     ) %&gt;% ungroup() %&gt;%
-    transmute(customer, sku, active = active_auto)
+    transmute(customer, sku, active = active_auto, slowmover = slowmover)
   #Adjustment 2: hard guarantee min 2 SKU active / customer #Update 0.2.2
   out &lt;- out %&gt;%
     left_join(base %&gt;% select(customer, sku, demand_week_pieces), by=c(&quot;customer&quot;,&quot;sku&quot;)) %&gt;%
@@ -1724,7 +1727,7 @@ auto_assortment_phase3 &lt;- function(
       mutate(
         active = ifelse(!is.na(active_prior), active_prior, active)
       ) %&gt;%
-      select(customer, sku, active)
+      select(customer, sku, active, slowmover)
   }
   
   out
@@ -1959,23 +1962,54 @@ supplier_params_default &lt;-refresh_ci_purch(supplier_params_default, CIpur_loo
 # =========================
 
 sales_demand_week &lt;- function(week, state, sales_decision_cp, sales_constants, exo,
-                              assortment_cp=NULL){
+                              assortment_cp=NULL, slowmover_cp=NULL){
   bench &lt;- sales_constants$observed$benchmark_demand
   
   vf &lt;- exo$volume_factor
   if (is.null(vf)) vf &lt;- tibble(customer=unique(bench$customer), volume_factor=1)
-  
+  vfm_multiplier &lt;- sales_constants$market_forces$value_for_money_multiplier %||% 1
+slowmover_multiplier &lt;- sales_constants$market_forces$slowmover_multiplier %||% 1
+
+customer_tbl &lt;- sales_constants$customer_master %||%
+  tibble(customer = unique(bench$customer), value_for_money = FALSE)
+
+customer_tbl &lt;- customer_tbl %&gt;%
+  mutate(customer = norm_customer(customer)) %&gt;%
+  select(customer, value_for_money)
+
+slow_tbl &lt;- slowmover_cp
+if (is.null(slow_tbl) &amp;&amp; !is.null(assortment_cp) &amp;&amp; &quot;slowmover&quot; %in% names(assortment_cp)) {
+  slow_tbl &lt;- assortment_cp %&gt;% select(customer, sku, slowmover)
+}
+if (is.null(slow_tbl)) {
+  slow_tbl &lt;- tibble(customer = character(), sku = character(), slowmover = logical())
+}
+
+slow_tbl &lt;- slow_tbl %&gt;%
+  mutate(
+    customer = norm_customer(customer),
+    sku = stringr::str_squish(sku)
+  ) %&gt;%
+  select(customer, sku, slowmover)
+##29/12
   dem &lt;- bench %&gt;%
-    left_join(vf, by=&quot;customer&quot;) %&gt;% 
+    left_join(vf, by=&quot;customer&quot;) %&gt;%
+    left_join(customer_tbl, by = &quot;customer&quot;) %&gt;%
+  left_join(slow_tbl, by = c(&quot;customer&quot;, &quot;sku&quot;)) %&gt;%##29/12
     mutate(
       volume_factor = replace_na(volume_factor, 1),               # &lt;&lt;&lt;&lt;&lt;&lt; FIX
-      demand_week_pieces = as.numeric(demand_week_pieces)         # &lt;&lt;&lt;&lt;&lt;&lt; FIX an toàn
+      demand_week_pieces = as.numeric(demand_week_pieces),        # &amp;lt;&amp;lt;&amp;lt;&amp;lt;&amp;lt;&amp;lt; FIX an toàn
+      value_for_money = replace_na(value_for_money, FALSE),
+      slowmover = replace_na(slowmover, FALSE)         # &lt;&lt;&lt;&lt;&lt;&lt; FIX an toàn
     ) %&gt;%
     left_join(sales_decision_cp %&gt;% select(customer, sku, promotional_pressure, ci_promised),
               by=c(&quot;customer&quot;,&quot;sku&quot;)) %&gt;%
     mutate(
       promotional_pressure = replace_na(promotional_pressure,&quot;none&quot;),
       promo_uplift = map_dbl(promotional_pressure, get_promo_uplift),
+       promo_uplift = promo_uplift *
+        ifelse(value_for_money, vfm_multiplier, 1) *
+        ifelse(slowmover, slowmover_multiplier, 1),
       demand_units = demand_week_pieces * volume_factor * (1 + promo_uplift),
       ci_promised  = replace_na(ci_promised,1))
   #Update 0.1.6 NEW: category management 
@@ -2753,7 +2787,8 @@ engine_round &lt;- function(state0, decisions, constants, lookups, exogenous, n_
       sales_decision_cp = decisions$sales$customer_product_level,
       sales_constants = constants$sales,
       exo = exogenous,
-      assortment_cp = decisions$sales$assortment_cp   ##Update 0.1.6
+      assortment_cp = decisions$sales$assortment_cp,   ##Update 0.1.6
+      slowmover_cp = decisions$sales$slowmover_cp
     )
     
     #PATCH Upadte 0.1.5 frozen production
@@ -3038,6 +3073,14 @@ assortment_cp_round0 &lt;- tibble::tribble(
     customer = norm_customer(customer),
     sku = stringr::str_squish(sku)
   )
+slowmover_cp_round0 &lt;- auto_assortment_phase3(
+  benchmark_demand   = benchmark_demand,
+  sales_exec_hist    = NULL,
+  df_sku             = df_sku,
+  sales_decision_cp  = sales_decision_cp_round0,
+  assortment_prior   = assortment_cp_round0
+) %&gt;%
+  dplyr::select(customer, sku, slowmover)
 
 shortage_rule0 &lt;- &quot;priority&quot;
 
@@ -3082,6 +3125,7 @@ decisions_round0 &lt;- list(
   sales = list(
     customer_product_level = sales_decision_cp_round0,
     assortment_cp = assortment_cp_round0,
+    slowmover_cp = slowmover_cp_round0,
     shortage_rule = shortage_rule0
   ),
   purchasing = list(
@@ -3146,7 +3190,8 @@ demand_w1 &lt;- sales_demand_week(
   sales_decision_cp = decisions_round0$sales$customer_product_level,
   sales_constants   = constants$sales,
   exo = exo,
-  assortment_cp = decisions_round0$sales$assortment_cp
+  assortment_cp = decisions_round0$sales$assortment_cp,
+  slowmover_cp = decisions_round0$sales$slowmover_cp
 )
 
 demand_sku_w1 &lt;- demand_w1 %&gt;%
@@ -3812,108 +3857,108 @@ out_base &lt;- engine_round(
 # 9) RUN PHASE 2 keep it real:))
 # =========================
 out_base$finance_round$ROI_pred</code></pre>
-<pre><code>## [1] 0.0449565</code></pre>
+<pre><code>## [1] 0.04775595</code></pre>
 <pre class="r"><code>out_base$finance_round</code></pre>
 <pre><code>## $ROI_pred
-## [1] 0.0449565
+## [1] 0.04775595
 ## 
 ## $revenue
-## [1] 2460315
+## [1] 2491036
 ## 
 ## $gross_margin
-## [1] 667398.1
+## [1] 679364.8
 ## 
 ## $operating_profit
-## [1] 158276.7
+## [1] 168303
 ## 
 ## $distribution_costs
-## [1] 169121.4
+## [1] 171061.8
 ## 
 ## $investment_total
-## [1] 3520663
+## [1] 3524231
 ## 
 ## $warehouse_costs
-## [1] 340000
+## [1] 340100.8
 ## 
 ## $scrap_costs
-## [1] 81172.28
+## [1] 80300.12
 ## 
 ## $admin_costs
-## [1] 112936.5
+## [1] 113526.6
 ## 
 ## $pi_costs_week
-## [1] 60032.49
+## [1] 63017.62
 ## 
 ## $tank_yard_costs
 ## [1] 3050
 ## 
 ## $cogs
-## [1] 1792917
+## [1] 1811671
 ## 
 ## $purchase_costs
-## [1] 724241.3
+## [1] 733118.6
 ## 
 ## $production_costs
-## [1] 436520.4
+## [1] 442315.8
 ## 
 ## $holding_costs
-## [1] 16362.22
+## [1] 16629.85
 ## 
 ## $penalty_costs
-## [1] 22115.55</code></pre>
+## [1] 23167.46</code></pre>
 </div>
 <div id="xem-nhanh-kết-quả-roi-pl" class="section level2">
 <h2>1) Xem nhanh kết quả ROI &amp; P&amp;L</h2>
 <pre class="r"><code>out_base$finance_round$ROI_pred</code></pre>
-<pre><code>## [1] 0.0449565</code></pre>
+<pre><code>## [1] 0.04775595</code></pre>
 <pre class="r"><code>out_base$finance_round</code></pre>
 <pre><code>## $ROI_pred
-## [1] 0.0449565
+## [1] 0.04775595
 ## 
 ## $revenue
-## [1] 2460315
+## [1] 2491036
 ## 
 ## $gross_margin
-## [1] 667398.1
+## [1] 679364.8
 ## 
 ## $operating_profit
-## [1] 158276.7
+## [1] 168303
 ## 
 ## $distribution_costs
-## [1] 169121.4
+## [1] 171061.8
 ## 
 ## $investment_total
-## [1] 3520663
+## [1] 3524231
 ## 
 ## $warehouse_costs
-## [1] 340000
+## [1] 340100.8
 ## 
 ## $scrap_costs
-## [1] 81172.28
+## [1] 80300.12
 ## 
 ## $admin_costs
-## [1] 112936.5
+## [1] 113526.6
 ## 
 ## $pi_costs_week
-## [1] 60032.49
+## [1] 63017.62
 ## 
 ## $tank_yard_costs
 ## [1] 3050
 ## 
 ## $cogs
-## [1] 1792917
+## [1] 1811671
 ## 
 ## $purchase_costs
-## [1] 724241.3
+## [1] 733118.6
 ## 
 ## $production_costs
-## [1] 436520.4
+## [1] 442315.8
 ## 
 ## $holding_costs
-## [1] 16362.22
+## [1] 16629.85
 ## 
 ## $penalty_costs
-## [1] 22115.55</code></pre>
+## [1] 23167.46</code></pre>
 <pre class="r"><code># =========================
 # 0B) LOAD GAME REFERENCE (TFC download)
 # =========================
@@ -3967,17 +4012,17 @@ compare_purchase &lt;- game_purchase_comp %&gt;%
 
 compare_purchase</code></pre>
 <pre><code>## # A tibble: 10 × 4
-##    component    purchase_value_previous_round purchase_value_engine     diff
-##    &lt;chr&gt;                                &lt;dbl&gt;                 &lt;dbl&gt;    &lt;dbl&gt;
-##  1 pack_1_liter                       110692.                   NA       NA 
-##  2 pack_1_liter                       126902.                   NA       NA 
-##  3 pet                                307931.               111404. -196527.
-##  4 pet                                275964.               111404. -164560.
-##  5 orange                             409042.               289979. -119063.
-##  6 orange                             464823.               289979. -174843.
-##  7 mango                               81658.                79874.   -1784.
-##  8 mango                               93070.                79874.  -13196.
-##  9 vitamin_c                            2295.                 1160.   -1135.
+##    component    purchase_value_previous_round purchase_value_engine      diff
+##    &lt;chr&gt;                                &lt;dbl&gt;                 &lt;dbl&gt;     &lt;dbl&gt;
+##  1 pack_1_liter                       110692.                   NA       NA  
+##  2 pack_1_liter                       126902.                   NA       NA  
+##  3 pet                                307931.               111801. -196130. 
+##  4 pet                                275964.               111801. -164163. 
+##  5 orange                             409042.               291685. -117357. 
+##  6 orange                             464823.               291685. -173138. 
+##  7 mango                               81658.                81753.      95.5
+##  8 mango                               93070.                81753.  -11317. 
+##  9 vitamin_c                            2295.                 1160.   -1135. 
 ## 10 vitamin_c                            1905.                 1160.    -745.</code></pre>
 <pre class="r"><code>engine_admin_summary &lt;- out_base$flows$distribution %&gt;%
   summarise(
@@ -3991,7 +4036,7 @@ engine_admin_summary</code></pre>
 <pre><code>## # A tibble: 1 × 4
 ##   inbound_orders inbound_orderlines inbound_admin_cost inbound_transport
 ##            &lt;dbl&gt;              &lt;dbl&gt;              &lt;dbl&gt;             &lt;dbl&gt;
-## 1             65                 65            112937.            102205</code></pre>
+## 1             65                 65            113527.            102739</code></pre>
 </div>
 
 
