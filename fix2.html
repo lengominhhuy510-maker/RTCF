@@ -679,7 +679,12 @@ sales_constants &lt;- list(
     slowmover_multiplier=2,
     uplift_method=&quot;midpoint&quot;
   ),
-  market_forces=list(volume_factor_min=0.90, volume_factor_max=1.10),
+  market_forces=list(
+    volume_factor_min=0.90,
+    volume_factor_max=1.10,
+    value_for_money_multiplier=2,
+    slowmover_multiplier=2
+  ),
   shortage_rules=list(methods=c(&quot;proportional&quot;,&quot;fcfs&quot;,&quot;priority&quot;)),
   customer_master=customer_master,
   observed=list(benchmark_demand=benchmark_demand),
@@ -1551,7 +1556,7 @@ auto_assortment_phase3 &lt;- function(
   # nếu không có history =&gt; trả baseline luôn
   if (is.null(sales_exec_hist) || is.null(df_sku)) {
     out &lt;- base %&gt;%
-      transmute(customer, sku, active = base_active)
+      transmute(customer, sku, active = base_active, slowmover = FALSE)
     
     # apply prior override nếu có
     if (!is.null(assortment_prior) &amp;&amp; nrow(assortment_prior)&gt;0){
@@ -1697,7 +1702,7 @@ auto_assortment_phase3 &lt;- function(
       deactivate_loss = (!keep_core) &amp; cm_total_sum &lt;= 0 &amp; (margin_bad | sla_bad | slowmover),
       active_auto = base_active &amp; !deactivate_loss
     ) %&gt;% ungroup() %&gt;%
-    transmute(customer, sku, active = active_auto)
+    transmute(customer, sku, active = active_auto, slowmover = slowmover)
   #Adjustment 2: hard guarantee min 2 SKU active / customer #Update 0.2.2
   out &lt;- out %&gt;%
     left_join(base %&gt;% select(customer, sku, demand_week_pieces), by=c(&quot;customer&quot;,&quot;sku&quot;)) %&gt;%
@@ -1959,23 +1964,53 @@ supplier_params_default &lt;-refresh_ci_purch(supplier_params_default, CIpur_loo
 # =========================
 
 sales_demand_week &lt;- function(week, state, sales_decision_cp, sales_constants, exo,
-                              assortment_cp=NULL){
+                              assortment_cp=NULL, slowmover_cp=NULL){
   bench &lt;- sales_constants$observed$benchmark_demand
   
   vf &lt;- exo$volume_factor
   if (is.null(vf)) vf &lt;- tibble(customer=unique(bench$customer), volume_factor=1)
   
+  vfm_multiplier &lt;- sales_constants$market_forces$value_for_money_multiplier %||% 1
+  slowmover_multiplier &lt;- sales_constants$market_forces$slowmover_multiplier %||% 1
+  
+  customer_tbl &lt;- sales_constants$customer_master %||%
+    tibble(customer = unique(bench$customer), value_for_money = FALSE)
+  customer_tbl &lt;- customer_tbl %&gt;%
+    mutate(customer = norm_customer(customer)) %&gt;%
+    select(customer, value_for_money)
+  
+  slow_tbl &lt;- slowmover_cp
+  if (is.null(slow_tbl) &amp;&amp; !is.null(assortment_cp) &amp;&amp; &quot;slowmover&quot; %in% names(assortment_cp)) {
+    slow_tbl &lt;- assortment_cp %&gt;% select(customer, sku, slowmover)
+  }
+  if (is.null(slow_tbl)) {
+    slow_tbl &lt;- tibble(customer=character(), sku=character(), slowmover=logical())
+  }
+  slow_tbl &lt;- slow_tbl %&gt;%
+    mutate(
+      customer = norm_customer(customer),
+      sku = stringr::str_squish(sku)
+    ) %&gt;%
+    select(customer, sku, slowmover)
+  
   dem &lt;- bench %&gt;%
     left_join(vf, by=&quot;customer&quot;) %&gt;% 
+    left_join(customer_tbl, by=&quot;customer&quot;) %&gt;%
+    left_join(slow_tbl, by=c(&quot;customer&quot;,&quot;sku&quot;)) %&gt;%
     mutate(
       volume_factor = replace_na(volume_factor, 1),               # &lt;&lt;&lt;&lt;&lt;&lt; FIX
-      demand_week_pieces = as.numeric(demand_week_pieces)         # &lt;&lt;&lt;&lt;&lt;&lt; FIX an toàn
+      demand_week_pieces = as.numeric(demand_week_pieces),        # &lt;&lt;&lt;&lt;&lt;&lt; FIX an toàn
+      value_for_money = replace_na(value_for_money, FALSE),
+      slowmover = replace_na(slowmover, FALSE)
     ) %&gt;%
     left_join(sales_decision_cp %&gt;% select(customer, sku, promotional_pressure, ci_promised),
               by=c(&quot;customer&quot;,&quot;sku&quot;)) %&gt;%
     mutate(
       promotional_pressure = replace_na(promotional_pressure,&quot;none&quot;),
       promo_uplift = map_dbl(promotional_pressure, get_promo_uplift),
+      promo_uplift = promo_uplift *
+        ifelse(value_for_money, vfm_multiplier, 1) *
+        ifelse(slowmover, slowmover_multiplier, 1),
       demand_units = demand_week_pieces * volume_factor * (1 + promo_uplift),
       ci_promised  = replace_na(ci_promised,1))
   #Update 0.1.6 NEW: category management 
@@ -2753,7 +2788,8 @@ engine_round &lt;- function(state0, decisions, constants, lookups, exogenous, n_
       sales_decision_cp = decisions$sales$customer_product_level,
       sales_constants = constants$sales,
       exo = exogenous,
-      assortment_cp = decisions$sales$assortment_cp   ##Update 0.1.6
+      assortment_cp = decisions$sales$assortment_cp,  ##Update 0.1.6
+      slowmover_cp = decisions$sales$slowmover_cp
     )
     
     #PATCH Upadte 0.1.5 frozen production
@@ -3039,6 +3075,15 @@ assortment_cp_round0 &lt;- tibble::tribble(
     sku = stringr::str_squish(sku)
   )
 
+slowmover_cp_round0 &lt;- auto_assortment_phase3(
+  benchmark_demand = benchmark_demand,
+  sales_exec_hist = NULL,
+  df_sku = df_sku,
+  sales_decision_cp = sales_decision_cp_round0,
+  assortment_prior = assortment_cp_round0
+) %&gt;%
+  dplyr::select(customer, sku, slowmover)
+
 shortage_rule0 &lt;- &quot;priority&quot;
 
 # ---- (4) Round0 PURCHASING agreement (from decision log)
@@ -3082,6 +3127,7 @@ decisions_round0 &lt;- list(
   sales = list(
     customer_product_level = sales_decision_cp_round0,
     assortment_cp = assortment_cp_round0,
+    slowmover_cp = slowmover_cp_round0,
     shortage_rule = shortage_rule0
   ),
   purchasing = list(
@@ -3146,7 +3192,8 @@ demand_w1 &lt;- sales_demand_week(
   sales_decision_cp = decisions_round0$sales$customer_product_level,
   sales_constants   = constants$sales,
   exo = exo,
-  assortment_cp = decisions_round0$sales$assortment_cp
+  assortment_cp = decisions_round0$sales$assortment_cp,
+  slowmover_cp = decisions_round0$sales$slowmover_cp
 )
 
 demand_sku_w1 &lt;- demand_w1 %&gt;%
