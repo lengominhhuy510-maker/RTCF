@@ -1,0 +1,13 @@
+supplier_id,supplier_region,supplier_tier
+SUP001,VN_North,Tier1
+SUP002,VN_North,Tier1
+SUP003,TH,Tier1
+SUP004,VN_North,Tier1
+SUP005,VN_North,Tier2
+SUP006,VN_North,Tier2
+SUP007,VN_North,Tier1
+SUP008,VN_North,Tier1
+SUP009,VN_North,Tier1
+SUP010,VN_North,Tier1
+SUP011,VN_North,Tier1
+SUP012,VN_South,Tier1

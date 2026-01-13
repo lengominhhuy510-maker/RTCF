@@ -1,0 +1,7 @@
+location_id,location_type,region
+WH_NORTH,Warehouse,North
+WH_SOUTH,Warehouse,South
+DC_HN,DC,North
+DC_DN,DC,Central
+DC_HCMC,DC,South
+DC_CT,DC,South

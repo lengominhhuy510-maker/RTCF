@@ -1,0 +1,11 @@
+node_id,node_type,region
+F1,Factory,North
+F2,Factory,South
+WH_NORTH,Warehouse,North
+WH_SOUTH,Warehouse,South
+PORT_HAI_PHONG,Port,North
+PORT_CAT_LAI,Port,South
+DC_HN,DC,North
+DC_DN,DC,Central
+DC_HCMC,DC,South
+DC_CT,DC,South

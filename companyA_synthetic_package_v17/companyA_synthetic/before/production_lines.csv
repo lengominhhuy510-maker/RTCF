@@ -1,0 +1,7 @@
+factory_id,production_line_id,line_type,shift_pattern,daily_capacity_machine_hours,daily_capacity_labor_hours
+F1,F1-L1,assembly_line,2x8h,13.6,20.0
+F1,F1-L2,modular_line,3x8h,20.4,30.0
+F1,F1-L3,sewing_cell,1x10h,8.5,12.5
+F2,F2-L1,assembly_line,3x8h,20.4,30.0
+F2,F2-L2,sewing_cell,2x8h,13.6,20.0
+F2,F2-L3,sewing_cell,1x10h,8.5,12.5

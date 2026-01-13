@@ -1,0 +1,9 @@
+lane_id,from_node,to_node,mode,capacity_units_per_day,transport_cost_per_unit,transit_time_days
+F1->WH_NORTH:Road,F1,WH_NORTH,Road,7000,0.18,1
+F2->WH_SOUTH:Road,F2,WH_SOUTH,Road,7000,0.17,1
+WH_NORTH->WH_SOUTH:Rail,WH_NORTH,WH_SOUTH,Rail,3000,0.22,2
+WH_NORTH->DC_HN:Road,WH_NORTH,DC_HN,Road,5000,0.12,1
+WH_NORTH->DC_DN:Road,WH_NORTH,DC_DN,Road,2500,0.2,2
+WH_SOUTH->DC_HCMC:Road,WH_SOUTH,DC_HCMC,Road,6000,0.11,1
+WH_SOUTH->DC_CT:Road,WH_SOUTH,DC_CT,Road,2500,0.14,1
+WH_SOUTH->DC_DN:Road,WH_SOUTH,DC_DN,Road,2000,0.21,2

@@ -1,0 +1,41 @@
+customer_id,customer_type,city,region
+CUST0001,Retail_DC,Nha Trang,Central
+CUST0002,Retail_DC,Hanoi,North
+CUST0003,Ecom_FC,Hanoi,North
+CUST0004,Retail_DC,Hai Phong,North
+CUST0005,Wholesale,Hanoi,North
+CUST0006,Wholesale,HCMC,South
+CUST0007,Retail_DC,Hanoi,North
+CUST0008,Wholesale,Nha Trang,Central
+CUST0009,Retail_DC,HCMC,South
+CUST0010,Ecom_FC,HCMC,South
+CUST0011,Retail_DC,Hanoi,North
+CUST0012,Wholesale,HCMC,South
+CUST0013,Retail_DC,HCMC,South
+CUST0014,Retail_DC,HCMC,South
+CUST0015,Retail_DC,Hanoi,North
+CUST0016,Wholesale,Hanoi,North
+CUST0017,Wholesale,Can Tho,South
+CUST0018,Ecom_FC,Da Nang,Central
+CUST0019,Wholesale,Hai Phong,North
+CUST0020,Wholesale,Nha Trang,Central
+CUST0021,Ecom_FC,HCMC,South
+CUST0022,Retail_DC,Can Tho,South
+CUST0023,Ecom_FC,Hai Phong,North
+CUST0024,Ecom_FC,Can Tho,South
+CUST0025,Retail_DC,Hanoi,North
+CUST0026,Retail_DC,HCMC,South
+CUST0027,Ecom_FC,HCMC,South
+CUST0028,Retail_DC,Hanoi,North
+CUST0029,Wholesale,Hanoi,North
+CUST0030,Retail_DC,Da Nang,Central
+CUST0031,Retail_DC,Can Tho,South
+CUST0032,Wholesale,HCMC,South
+CUST0033,Retail_DC,Can Tho,South
+CUST0034,Retail_DC,HCMC,South
+CUST0035,Ecom_FC,Nha Trang,Central
+CUST0036,Wholesale,HCMC,South
+CUST0037,Retail_DC,Hanoi,North
+CUST0038,Retail_DC,Hanoi,North
+CUST0039,Ecom_FC,HCMC,South
+CUST0040,Wholesale,HCMC,South

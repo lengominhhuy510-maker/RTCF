@@ -1,0 +1,1113 @@
+---
+title: "Company A — Lean Production & Operations Story (Root Cause → Solution → Impact)"
+author: "Operations Analytics (handcrafted narrative on synthetic raw data)"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: flatly
+    df_print: paged
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(scales)
+})
+
+ensure_pkg <- function(p){
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+}
+ensure_pkg("highcharter")
+ensure_pkg("lpSolve")
+ensure_pkg("DiagrammeR")
+
+library(highcharter)
+library(lpSolve)
+library(DiagrammeR)
+
+options(highcharter.theme = hc_theme_flat())
+hc_lang <- list(thousandsSep = ",", decimalPoint = ".")
+
+# Highcharter version compatibility: some versions do not have hc_lang()
+hc_lang_safe <- function(h, lang_list){
+  # If hc_lang exists, use it; otherwise try hc_opts(lang=...); else no-op.
+  if (exists("hc_lang", where=asNamespace("highcharter"), inherits=FALSE)) {
+    return(highcharter::hc_lang(h, lang_list))
+  }
+  if (exists("hc_opts", where=asNamespace("highcharter"), inherits=FALSE)) {
+    return(highcharter::hc_opts(h, lang = lang_list))
+  }
+  h
+}
+
+
+# ---- run-from-anywhere path helper ----
+get_script_dir <- function(){
+  cmdArgs <- commandArgs(trailingOnly = FALSE)
+  fileArgName <- "--file="
+  m <- grep(fileArgName, cmdArgs)
+  if (length(m) > 0) return(dirname(normalizePath(sub(fileArgName, "", cmdArgs[m]), winslash="/")))
+  if (!is.null(sys.frames()[[1]]$ofile)) return(dirname(normalizePath(sys.frames()[[1]]$ofile, winslash="/")))
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    p <- rstudioapi::getActiveDocumentContext()$path
+    if (nzchar(p)) return(dirname(normalizePath(p, winslash="/")))
+  }
+  normalizePath(getwd(), winslash="/")
+}
+PROJECT_ROOT <- get_script_dir()
+base_dir <- file.path(PROJECT_ROOT, "companyA_synthetic")
+dir.create(file.path(base_dir, "analysis_outputs_r"), showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(base_dir, "optimization_outputs_r"), showWarnings = FALSE, recursive = TRUE)
+
+COL_BEFORE <- "#2C3E50"
+COL_AFTER  <- "#18BC9C"
+COL_WARN   <- "#F39C12"
+COL_BAD    <- "#E74C3C"
+
+# Helper: highcharter time series
+hc_timeseries <- function(df, x, y, group=NULL, title="", ytitle="", subtitle=""){
+  df <- df %>% arrange({{x}})
+  h <- highchart() %>%
+    hc_chart(zoomType="x") %>%
+    hc_title(text = title) %>%
+    hc_subtitle(text = subtitle) %>%
+    hc_xAxis(type="datetime") %>%
+    hc_yAxis(title = list(text=ytitle)) %>%
+    hc_tooltip(shared=TRUE, crosshairs=TRUE) %>% hc_lang_safe(hc_lang)
+  if (is.null(group)){
+    h <- h %>% hc_add_series(df, "line", hcaes(x={{x}}, y={{y}}))
+  } else {
+    h <- h %>% hc_add_series_list(
+      df %>%
+        group_by({{group}}) %>%
+        group_map(~ list(
+          name = as.character((unique(.x %>% pull({{group}}))[1])),
+          type = "line",
+          data = .x %>% transmute(x=datetime_to_timestamp({{x}}), y={{y}}) %>% list_parse2()
+        ))
+    )
+  }
+  h
+}
+
+datetime_to_timestamp <- function(x){
+  as.numeric(as.POSIXct(x)) * 1000
+}
+
+```
+
+# 1) What this report does (and why it looks like a human analysis)
+
+Instead of jumping straight to a **Before vs After dashboard**, this report follows a typical ops workflow:
+
+1. **Baseline deep dive (BEFORE only)**  
+   Break production performance down into *where time goes*, *where queues form*, and *where defects appear*.
+
+2. **Problem statement (Lean wastes with evidence)**  
+   Translate patterns into Lean waste types: waiting, defects, inventory, transportation.
+
+3. **Solutions**  
+   - Lean countermeasures (SMED, line balancing, quality-at-source, pull/kanban, leveling)
+   - Optimization models (LP production + network flow) as the *decision engine*
+
+4. **Impact**  
+   Compare BEFORE vs AFTER only after the story is clear.
+
+All metrics are computed from **raw event/transaction data** (no KPIs stored in the dataset).
+
+
+
+## 1.1 Story map (read top-down, then trace bottom-up)
+
+```{r story-map}
+# Story map = how to read (top-down) and how to trace causes (bottom-up).
+# Safe DiagrammeR DOT string (no parse issues).
+
+ensure_pkg <- function(p){
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+}
+ensure_pkg("DiagrammeR")
+library(DiagrammeR)
+
+dot <- paste0(
+'digraph G {
+',
+'  graph [rankdir=TB, bgcolor="white"];
+',
+'  node [shape=box, style="rounded,filled", color="#bdc3c7", fillcolor="#f8f9fa", fontname="Arial"];
+',
+'  edge [color="#7f8c8d"];
+',
+'  A [label="Demand (variability)\nspikes/seasonality"];
+',
+'  B [label="Capacity context\n(machine-hours)"];
+',
+'  C [label="Flow symptoms\nWaiting + WIP"];
+',
+'  D [label="Bottleneck evidence\n(utilization heatmap)"];
+',
+'  E [label="Quality loss\n(reject + rework + Pareto)"];
+',
+'  F [label="Inventory imbalance\n(on-hand vs backorder)"];
+',
+'  G [label="Solutions\nLean countermeasures"];
+',
+'  H [label="Optimization\nProduction LP + Network flow"];
+',
+'  I [label="Impact\nBefore vs After"];
+',
+'  A -> B -> C -> D;
+',
+'  D -> E;
+',
+'  E -> C;
+',
+'  C -> F;
+',
+'  D -> G -> H -> I;
+',
+'  F -> I;
+',
+'}
+'
+)
+
+grViz(dot)
+```
+
+**How to read it (Feynman-simple):**
+- **Top-down:** demand hits the factory → the flow creates WIP/queues + defects → inventory and shipments tell you if customers feel pain.
+- **Bottom-up:** if customers are late/stocked-out → check shipments → check inventory/backorders → check where WIP piles up → that points to bottleneck + quality issues.
+
+
+# 2) Load raw data (before/after)
+
+```{r load-raw}
+load_scn <- function(scn){
+  d <- file.path(base_dir, scn)
+  list(
+    prod = read_csv(file.path(d,"production_events.csv"), show_col_types = FALSE) %>%
+      mutate(step_start_time = ymd_hms(step_start_time),
+             step_end_time   = ymd_hms(step_end_time)),
+    qi   = read_csv(file.path(d,"quality_inspections.csv"), show_col_types = FALSE) %>%
+      mutate(inspection_time = ymd_hms(inspection_time)),
+    inv  = read_csv(file.path(d,"inventory_snapshots.csv"), show_col_types = FALSE) %>%
+      mutate(snapshot_date = ymd(snapshot_date)),
+    dem  = read_csv(file.path(d,"demand_orders.csv"), show_col_types = FALSE) %>%
+      mutate(order_date = ymd(order_date),
+             due_date   = ymd(due_date)),
+    sh   = read_csv(file.path(d,"shipments.csv"), show_col_types = FALSE) %>%
+      mutate(ship_date = ymd(ship_date),
+             planned_delivery_date = ymd(planned_delivery_date),
+             actual_delivery_date  = ymd(actual_delivery_date)),
+    lines = read_csv(file.path(d,"production_lines.csv"), show_col_types = FALSE),
+    skus  = read_csv(file.path(d,"skus.csv"), show_col_types = FALSE),
+    lanes = read_csv(file.path(d,"transportation_lanes.csv"), show_col_types = FALSE),
+    customers = read_csv(file.path(d,"customers.csv"), show_col_types = FALSE),
+    scenario = scn
+  )
+}
+
+B <- load_scn("before")
+A <- load_scn("after")
+```
+
+# 3) Baseline deep dive (BEFORE): What is breaking operations?
+
+## 3.1 Demand shape (seasonality + spikes)
+
+```{r demand-shape}
+# Demand variability itself is not waste.
+# Waste happens when the system cannot absorb variability → waiting, overtime, expediting, inventory swings.
+
+dem_wk <- B$dem %>%
+  mutate(week = as.Date(floor_date(due_date, "week", week_start=1))) %>%
+  group_by(week) %>%
+  summarise(demand_qty = sum(demand_qty), orders=n(), .groups="drop") %>%
+  arrange(week)
+
+# ---- Reference lines (context) ----
+avg_demand <- mean(dem_wk$demand_qty)
+
+# Design capacity proxy in UNITS:
+# Convert line machine-hour capacity to units using observed avg machine-hours per unit from raw events.
+shift_hours <- c("2x8h"=16, "3x8h"=24, "1x10h"=10)
+cap_mh_week <- B$lines %>%
+  mutate(
+    daily_capacity_machine_hours = if_else(is.na(daily_capacity_machine_hours),
+                                           as.numeric(shift_hours[shift_pattern])*0.85,
+                                           daily_capacity_machine_hours),
+    weekly_capacity_machine_hours = daily_capacity_machine_hours * 6
+  ) %>% summarise(total_cap_mh = sum(weekly_capacity_machine_hours)) %>% pull(total_cap_mh)
+
+mh_per_unit <- B$prod %>%
+  filter(produced_qty > 0) %>%
+  summarise(mh_per_unit = sum(machine_hours, na.rm=TRUE) / sum(produced_qty, na.rm=TRUE)) %>%
+  pull(mh_per_unit)
+
+mh_per_unit <- ifelse(is.na(mh_per_unit) || mh_per_unit <= 0, 0.02, mh_per_unit)
+design_capacity_units <- cap_mh_week / mh_per_unit
+
+# Heijunka target (level-loaded): choose a stable target that stays within design capacity.
+heijunka_target <- min(avg_demand, design_capacity_units * 0.92)
+
+dem_wk <- dem_wk %>%
+  mutate(avg_line = avg_demand,
+         cap_line = design_capacity_units,
+         heijunka = heijunka_target,
+         week_ts = as.numeric(as.POSIXct(week)) * 1000)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Demand per week (BEFORE) — variability with capacity context") %>%
+  hc_subtitle(text="Ref lines: Avg demand, Design capacity (units proxy), Heijunka target (level-loaded)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Units")) %>%
+  hc_add_series(dem_wk, "line", hcaes(x=week_ts, y=demand_qty), name="Demand", color=COL_BEFORE) %>%
+  hc_add_series(dem_wk, "line", hcaes(x=week_ts, y=avg_line),  name="Avg demand", dashStyle="ShortDot", color=COL_WARN) %>%
+  hc_add_series(dem_wk, "line", hcaes(x=week_ts, y=cap_line),  name="Design capacity", dashStyle="Dash", color=COL_BAD) %>%
+  hc_add_series(dem_wk, "line", hcaes(x=week_ts, y=heijunka),  name="Heijunka target", dashStyle="ShortDash", color=COL_AFTER) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_lang_safe(hc_lang)
+```
+
+**How to read:** Demand spikes are not inherently bad — the question is whether production can *level-load* or whether spikes become **waiting, overtime, expediting**.
+
+## 3.2 Throughput vs Demand gap (service risk)
+
+```{r throughput-vs-demand}
+# Put demand & production on the SAME week type (Date) before joining.
+prod_wk <- B$prod %>%
+  mutate(week = as.Date(floor_date(step_start_time, "week", week_start=1))) %>%
+  group_by(week) %>%
+  summarise(produced_qty=sum(produced_qty), .groups="drop")
+
+dem_wk2 <- B$dem %>%
+  mutate(week = as.Date(floor_date(due_date, "week", week_start=1))) %>%
+  group_by(week) %>%
+  summarise(demand_qty = sum(demand_qty), .groups="drop")
+
+td <- full_join(dem_wk2, prod_wk, by="week") %>%
+  replace_na(list(demand_qty=0, produced_qty=0)) %>%
+  mutate(
+    gap = produced_qty - demand_qty,
+    week_ts = datetime_to_timestamp(as.POSIXct(week)),
+    point_color = case_when(
+      gap < 0 ~ COL_BAD,                                        # shortage risk
+      gap < quantile(gap, 0.6, na.rm=TRUE) ~ COL_WARN,          # mild overproduction
+      TRUE ~ COL_AFTER                                          # heavy overproduction
+    )
+  ) %>%
+  arrange(week)
+
+# Build explicit point objects so Highcharts always renders per-point colors.
+gap_pts <- td %>% transmute(x = week_ts, y = gap, color = point_color) %>% list_parse2()
+
+highchart() %>%
+  hc_chart(zoomType="xy") %>%
+  hc_title(text="Throughput vs Demand (BEFORE)") %>%
+  hc_subtitle(text="Column = gap (Prod - Demand); lines = produced & demand (zoomable)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis_multiples(
+    list(title=list(text="Units")),
+    list(title=list(text="Gap"), opposite=TRUE)
+  ) %>%
+  hc_add_series(
+    data = gap_pts,
+    type="column",
+    name="Gap (Prod - Demand)",
+    yAxis=1,
+    showInLegend=TRUE,
+    opacity=0.65
+  ) %>%
+  hc_add_series(td, type="line", hcaes(x=week_ts, y=produced_qty),
+                name="Produced", color=COL_BEFORE, yAxis=0, showInLegend=TRUE) %>%
+  hc_add_series(td, type="line", hcaes(x=week_ts, y=demand_qty),
+                name="Demand", color="#4285F4", dashStyle="ShortDot", yAxis=0, showInLegend=TRUE) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+```
+
+
+
+## 3.3 Value Stream Breakdown (where time goes): Cycle vs Waiting by step
+
+We compute:
+- **Cycle time** = `step_end_time - step_start_time`
+- **Waiting time** = gap between current `step_start_time` and previous step's `step_end_time` in the same `work_order_id`
+
+```{r vsm-breakdown}
+p <- B$prod %>%
+  mutate(cycle_min = as.numeric(difftime(step_end_time, step_start_time, units="mins"))) %>%
+  arrange(work_order_id, step_start_time) %>%
+  group_by(work_order_id) %>%
+  mutate(prev_end = lag(step_end_time),
+         wait_min = pmax(0, as.numeric(difftime(step_start_time, prev_end, units="mins")))) %>%
+  ungroup()
+
+by_step <- p %>%
+  group_by(operation_step) %>%
+  summarise(
+    avg_cycle = mean(cycle_min, na.rm=TRUE),
+    p95_cycle = quantile(cycle_min, 0.95, na.rm=TRUE),
+    avg_wait  = mean(wait_min, na.rm=TRUE),
+    p95_wait  = quantile(wait_min, 0.95, na.rm=TRUE),
+    events = n(),
+    .groups="drop"
+  ) %>%
+  arrange(desc(p95_wait))
+
+# Stacked bars (avg cycle + avg wait)
+stack_df <- by_step %>%
+  select(operation_step, avg_cycle, avg_wait) %>%
+  pivot_longer(cols=c(avg_cycle, avg_wait), names_to="component", values_to="minutes") %>%
+  mutate(component = recode(component, avg_cycle="Avg cycle", avg_wait="Avg waiting"))
+
+highchart() %>%
+  hc_chart(type="bar") %>%
+  hc_title(text="Value Stream time by operation step (BEFORE)") %>%
+  hc_subtitle(text="Stacked: Avg cycle vs Avg waiting — waiting is pure waste") %>%
+  hc_xAxis(categories = stack_df %>% distinct(operation_step) %>% pull(operation_step)) %>%
+  hc_yAxis(title=list(text="Minutes")) %>%
+  hc_plotOptions(series=list(stacking="normal")) %>%
+  hc_add_series(
+    stack_df %>% filter(component=="Avg cycle") %>% arrange(operation_step) %>% pull(minutes),
+    name="Avg cycle", color=COL_BEFORE
+  ) %>%
+  hc_add_series(
+    stack_df %>% filter(component=="Avg waiting") %>% arrange(operation_step) %>% pull(minutes),
+    name="Avg waiting", color=COL_BAD
+  ) %>%
+  hc_tooltip(shared=TRUE) %>% hc_lang_safe(hc_lang)
+```
+
+**Interpretation guide:**  
+- Steps with **high waiting** are your *queue points* (bottleneck symptom).  
+- Steps with **high p95 cycle** indicate instability (variation) and/or rework loops.
+
+## 3.4 Bottleneck confirmation: utilization heatmap (BEFORE)
+
+```{r util-heatmap}
+shift_hours <- c("2x8h"=16, "3x8h"=24, "1x10h"=10)
+lines_cap <- B$lines %>%
+  mutate(
+    daily_capacity_machine_hours = if_else(is.na(daily_capacity_machine_hours),
+                                           as.numeric(shift_hours[shift_pattern])*0.85,
+                                           daily_capacity_machine_hours),
+    weekly_capacity_machine_hours = daily_capacity_machine_hours * 6
+  ) %>% select(production_line_id, weekly_capacity_machine_hours)
+
+util <- B$prod %>%
+  mutate(week = format(floor_date(step_start_time, "week", week_start=1), "%Y-%m-%d")) %>%
+  group_by(week, production_line_id) %>%
+  summarise(machine_hours=sum(machine_hours, na.rm=TRUE), .groups="drop") %>%
+  left_join(lines_cap, by="production_line_id") %>%
+  mutate(util = machine_hours / weekly_capacity_machine_hours)
+
+# Heatmap data prep for highcharter (x=week index, y=line index)
+weeks <- util %>% distinct(week) %>% arrange(week) %>% pull(week)
+lines <- util %>% distinct(production_line_id) %>% arrange(production_line_id) %>% pull(production_line_id)
+
+hm <- util %>%
+  mutate(x = match(week, weeks) - 1,
+         y = match(production_line_id, lines) - 1) %>%
+  transmute(x, y, value = round(util, 2))
+
+highchart() %>%
+  hc_chart(type="heatmap", zoomType="xy") %>%
+  hc_title(text="Bottleneck heatmap (BEFORE) — line utilization (machine)") %>%
+  hc_xAxis(categories = weeks, title=list(text="Week")) %>%
+  hc_yAxis(categories = lines, title=list(text="Line"), reversed=TRUE) %>%
+  hc_colorAxis(stops = color_stops(n=5, colors = c("#ecf0f1", "#95a5a6", "#7f8c8d", "#34495e", "#000000"))) %>%
+  hc_add_series(
+    data = hm %>% list_parse(),
+    name = "Utilization",
+    borderWidth = 0.5
+  ) %>%
+  hc_tooltip(formatter = JS("function(){return '<b>Week:</b> '+ this.series.xAxis.categories[this.point.x] + 
+                                     '<br><b>Line:</b> '+ this.series.yAxis.categories[this.point.y] +
+                                     '<br><b>Util:</b> '+ this.point.value;}")) %>% hc_lang_safe(hc_lang)
+```
+
+**What to look for:** persistent dark bands = chronic bottleneck; random spikes = instability (breakdowns / changeover / staffing).
+
+## 3.5 Quality breakdown: Pareto of defect types (BEFORE)
+
+```{r defect-pareto}
+qi <- B$qi %>% mutate(defect_code = replace_na(defect_code, "NONE"))
+def <- qi %>%
+  filter(defect_code != "NONE") %>%
+  group_by(defect_code) %>%
+  summarise(defects = sum(defects_found_qty, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(defects)) %>%
+  mutate(pct = defects / sum(defects),
+         cum = cumsum(pct))
+
+top_n <- min(10, nrow(def))
+def_top <- def %>% slice_head(n=top_n)
+
+highchart() %>%
+  hc_title(text="Defect Pareto (BEFORE) — top defect types") %>%
+  hc_xAxis(categories = def_top$defect_code) %>%
+  hc_yAxis_multiples(
+    list(title=list(text="Defect qty")),
+    list(title=list(text="Cumulative %"), opposite=TRUE, labels=list(format="{value}%"))
+  ) %>%
+  hc_add_series(name="Defects", type="column", data=def_top$defects, color=COL_BAD) %>%
+  hc_add_series(name="Cum%", type="spline", data=round(def_top$cum*100,1), yAxis=1, color=COL_BEFORE) %>%
+  hc_tooltip(shared=TRUE) %>% hc_lang_safe(hc_lang)
+```
+
+**Lean callout:** Pareto tells you where to focus **quality-at-source** first.
+
+
+
+## 3.6 Quality signal (derived): Reject & Rework rate over time (BEFORE)
+
+This is a *signal*, not a KPI stored in raw tables. We derive it from production events:
+- **Reject rate** = rejected_qty / produced_qty
+- **Rework rate** = rework_qty / produced_qty
+
+```{r quality-signal}
+q_week <- B$prod %>%
+  mutate(week = as.Date(floor_date(step_start_time, "week", week_start=1))) %>%
+  group_by(week) %>%
+  summarise(
+    produced = sum(produced_qty, na.rm=TRUE),
+    rejected = sum(rejected_qty, na.rm=TRUE),
+    rework   = sum(rework_qty,   na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  mutate(
+    reject_rate = if_else(produced > 0, rejected / produced, NA_real_),
+    rework_rate = if_else(produced > 0, rework   / produced, NA_real_),
+    week_ts = datetime_to_timestamp(as.POSIXct(week))
+  ) %>%
+  arrange(week)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Quality signal (BEFORE) — reject & rework rate") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Rate"), labels=list(format="{value:.1%}")) %>%
+  hc_add_series(q_week, "line", hcaes(x=week_ts, y=reject_rate), name="Reject rate", color=COL_BAD) %>%
+  hc_add_series(q_week, "line", hcaes(x=week_ts, y=rework_rate), name="Rework rate", color=COL_WARN, dashStyle="ShortDot") %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE, valueDecimals=3, valueSuffix="") %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+```
+
+**Interpretation (simple):** If reject/rework rises, it *steals capacity* and creates hidden waiting + WIP.
+
+## 3.7 Inventory imbalance (BEFORE): Backorders vs Excess signals
+
+We read inventory snapshots and derive:
+- **Backorder** (demand not served) → customer pain
+- **Stockout signals** (on_hand <= 0) → service risk
+
+```{r inventory-imbalance}
+inv_wk <- B$inv %>%
+  mutate(week = as.Date(floor_date(snapshot_date, "week", week_start=1))) %>%
+  group_by(week) %>%
+  summarise(
+    on_hand_total   = sum(on_hand_qty, na.rm=TRUE),
+    backorder_total = sum(backorder_qty, na.rm=TRUE),
+    stockout_sku_loc = sum(on_hand_qty <= 0, na.rm=TRUE),
+    holding_cost_day = sum(pmax(on_hand_qty,0) * holding_cost_per_unit_per_day, na.rm=TRUE),
+    .groups="drop"
+  ) %>%
+  mutate(week_ts = datetime_to_timestamp(as.POSIXct(week))) %>%
+  arrange(week)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Inventory imbalance (BEFORE) — backorders & stockout signals") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis_multiples(
+    list(title=list(text="Units")),
+    list(title=list(text="# sku-locations in stockout"), opposite=TRUE)
+  ) %>%
+  hc_add_series(inv_wk, "column", hcaes(x=week_ts, y=backorder_total),
+                name="Backorder units", color=COL_BAD, opacity=0.55, showInLegend=TRUE, yAxis=0) %>%
+  hc_add_series(inv_wk, "line", hcaes(x=week_ts, y=stockout_sku_loc),
+                name="Stockout signals", color=COL_WARN, showInLegend=TRUE, yAxis=1) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+# Where is holding cost concentrated? (top 12 sku-location)
+inv_top <- B$inv %>%
+  mutate(cost_day = pmax(on_hand_qty,0) * holding_cost_per_unit_per_day) %>%
+  group_by(location_id, sku_id) %>%
+  summarise(cost_day = sum(cost_day, na.rm=TRUE), .groups="drop") %>%
+  arrange(desc(cost_day)) %>%
+  slice_head(n=12) %>%
+  mutate(label = paste0(location_id, " | ", sku_id))
+
+highchart() %>%
+  hc_chart(type="bar") %>%
+  hc_title(text="Where inventory cost sits (BEFORE) — top sku-location by holding cost/day") %>%
+  hc_xAxis(categories = inv_top$label) %>%
+  hc_yAxis(title=list(text="Holding cost per day")) %>%
+  hc_add_series(name="Holding cost/day", data=round(inv_top$cost_day,2), color=COL_BEFORE) %>%
+  hc_tooltip(shared=TRUE) %>%
+  hc_lang_safe(hc_lang)
+```
+
+## 3.8 WIP build-up (BEFORE): Where work gets stuck
+
+WIP = "half-finished garments". We estimate WIP by sampling each day at noon:
+- count how many production steps are **in-progress** (start <= t < end)
+
+```{r wip-build}
+# WIP derived from raw events (start/end timestamps).
+# Fix legend: series names are operation_step values (no "Series 1/2/3").
+
+prod_ev <- B$prod %>%
+  mutate(start = step_start_time, end = step_end_time) %>%
+  filter(!is.na(start), !is.na(end), end >= start)
+
+t0 <- as.Date(min(prod_ev$start))
+t1 <- as.Date(max(prod_ev$end))
+days <- seq.Date(t0, t1, by="day")
+steps <- sort(unique(prod_ev$operation_step))
+
+wip_by_step <- purrr::map_dfr(steps, function(st){
+  x <- prod_ev %>% filter(operation_step == st)
+  cnt <- sapply(days, function(d){
+    tt <- as.POSIXct(d) + lubridate::hours(12)  # mid-day sample
+    sum(x$start <= tt & x$end > tt)
+  })
+  tibble(day = days, operation_step = st, wip = as.integer(cnt))
+})
+
+# Total WIP
+wip_total <- wip_by_step %>%
+  group_by(day) %>%
+  summarise(wip_total = sum(wip), .groups="drop") %>%
+  mutate(day_ts = as.numeric(as.POSIXct(day)) * 1000)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="WIP build-up (BEFORE) — total in-progress items") %>%
+  hc_subtitle(text="WIP spike = congestion (work waiting inside the system), not throughput") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="WIP (count)")) %>%
+  hc_add_series(wip_total, "line", hcaes(x=day_ts, y=wip_total), name="Total WIP", color=COL_BEFORE) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+# WIP by step (stacked area)
+wip_step_ts <- wip_by_step %>% mutate(day_ts = as.numeric(as.POSIXct(day)) * 1000)
+
+hc <- highchart() %>%
+  hc_chart(type="area", zoomType="x") %>%
+  hc_title(text="WIP by operation step (BEFORE) — where congestion accumulates") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="WIP (count)")) %>%
+  hc_plotOptions(area=list(stacking="normal", marker=list(enabled=FALSE))) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+for (st in steps){
+  d <- wip_step_ts %>%
+    filter(operation_step == st) %>%
+    transmute(x = day_ts, y = wip) %>%
+    list_parse2()
+  hc <- hc %>% hc_add_series(data=d, type="area", name=st)
+}
+hc
+```
+
+
+## 3.9 Delivery performance: lateness distribution (BEFORE)
+
+```{r lateness}
+sh <- B$sh %>%
+  mutate(late_days = pmax(0, as.numeric(difftime(actual_delivery_date, planned_delivery_date, units="days"))))
+
+# show distribution as interactive histogram
+bins <- sh %>%
+  mutate(bin = pmin(late_days, 15)) %>% # cap long tail
+  count(bin)
+
+highchart() %>%
+  hc_title(text="Shipment lateness distribution (BEFORE)") %>%
+  hc_subtitle(text="0 = on time; right tail = expediting / firefighting") %>%
+  hc_xAxis(categories = as.character(bins$bin), title=list(text="Late days (capped at 15)")) %>%
+  hc_yAxis(title=list(text="Shipments")) %>%
+  hc_add_series(name="Shipments", type="column", data=bins$n, color=COL_BEFORE) %>% hc_lang_safe(hc_lang)
+```
+
+# 4) Problem statement: Lean wastes with evidence (BEFORE)
+
+Based on the baseline charts:
+
+- **Waiting (Queues):** Value Stream breakdown shows steps where *avg waiting dominates*.
+- **Bottleneck:** Utilization heatmap shows lines with sustained high utilization.
+- **Defects/Rework:** Pareto highlights defect types driving most quality loss.
+- **Delivery delays:** Lateness histogram shows firefighting risk.
+- **Inventory imbalance:** inventory snapshots show backorders & stockout signals (service pain) and where holding cost concentrates.
+- **Hidden WIP:** WIP snapshots show where half-finished work piles up (queues between steps).
+
+In Lean terms, this is a classic combo: **unlevel demand + bottleneck capacity + quality issues → waiting, expediting, and hidden WIP.**
+
+# 5) Solutions: Lean countermeasures + Optimization engines
+
+## 5.1 Lean countermeasures (what we changed in AFTER)
+
+- **SMED / changeover reduction:** lower setup time volatility on the bottleneck line.
+- **Line balancing:** shift some SKU mix away from the bottleneck; stabilize cycle times.
+- **Quality at source:** reduce defect rate + rework loops (target top Pareto defects).
+- **Pull signals:** reduce excess inventory / backorders by better syncing production with demand.
+- **Logistics discipline:** reduce late shipments by planning lanes with capacity.
+
+These are exactly the “after scenario” transformations encoded in the synthetic generator.
+
+## 5.2 Optimization 1 — Production Planning LP (weekly)
+
+The LP decides **how much each SKU to make on each line each week**, under machine-hour capacity.
+
+```{r production-lp}
+prod <- B$prod; lines_m <- B$lines; skus <- B$skus; dem <- B$dem; inv_snap <- B$inv
+
+dem <- dem %>% mutate(week = format(floor_date(due_date, unit="week", week_start=1), "%Y-%m-%d"))
+weeks <- sort(unique(dem$week))
+sku_list <- sort(unique(skus$sku_id))
+
+demand_wk <- dem %>% group_by(week, sku_id) %>%
+  summarise(demand_qty=sum(demand_qty), avg_penalty=mean(penalty_cost_late), .groups="drop")
+
+grid <- expand_grid(week=weeks, sku_id=sku_list) %>%
+  left_join(demand_wk, by=c("week","sku_id")) %>%
+  mutate(demand_qty = replace_na(demand_qty, 0),
+         avg_penalty = replace_na(avg_penalty, median(dem$penalty_cost_late)))
+
+unit_mh <- prod %>% filter(produced_qty > 0) %>%
+  group_by(sku_id) %>%
+  summarise(mh_per_unit = sum(machine_hours, na.rm=TRUE)/sum(produced_qty, na.rm=TRUE), .groups="drop") %>%
+  right_join(skus %>% select(sku_id, product_category), by="sku_id") %>%
+  group_by(product_category) %>%
+  mutate(mh_per_unit = if_else(is.na(mh_per_unit), median(mh_per_unit, na.rm=TRUE), mh_per_unit)) %>%
+  ungroup() %>%
+  mutate(mh_per_unit = pmax(0.01, mh_per_unit)) %>%
+  select(sku_id, mh_per_unit)
+
+shift_hours <- c("2x8h"=16, "3x8h"=24, "1x10h"=10)
+lines_cap <- lines_m %>%
+  mutate(daily_capacity_machine_hours = if_else(is.na(daily_capacity_machine_hours),
+                                               as.numeric(shift_hours[shift_pattern])*0.85,
+                                               daily_capacity_machine_hours),
+         weekly_capacity_machine_hours = daily_capacity_machine_hours * 6) %>%
+  select(factory_id, production_line_id, weekly_capacity_machine_hours)
+
+line_list <- sort(unique(lines_cap$production_line_id))
+cap_map <- lines_cap %>% select(production_line_id, weekly_capacity_machine_hours) %>% deframe()
+
+# eligibility: sku -> factory -> lines
+sku_factory_hist <- prod %>% count(sku_id, factory_id, sort=TRUE) %>%
+  group_by(sku_id) %>% slice_max(n, n=1, with_ties=FALSE) %>% ungroup() %>%
+  select(sku_id, factory_id)
+fallback <- skus %>% mutate(factory_id = if_else(product_category %in% c("Tee","Polo","Short","Dress"), "F1", "F2")) %>%
+  select(sku_id, factory_id)
+sku_factory <- fallback %>% left_join(sku_factory_hist, by="sku_id", suffix=c("_fb","_hist")) %>%
+  mutate(factory_id = coalesce(factory_id_hist, factory_id_fb)) %>%
+  select(sku_id, factory_id)
+
+eligible <- sku_factory %>%
+  left_join(lines_cap %>% select(factory_id, production_line_id), by="factory_id", relationship="many-to-many") %>%
+  distinct(sku_id, production_line_id)
+elig_set <- eligible %>% mutate(key=paste0(sku_id,"|",production_line_id)) %>% pull(key) %>% unique()
+
+# costs
+costs <- inv_snap %>%
+  group_by(sku_id) %>%
+  summarise(hold_cost_day = mean(holding_cost_per_unit_per_day, na.rm=TRUE),
+            stockout_cost = mean(stockout_cost_per_unit, na.rm=TRUE), .groups="drop")
+global_hold <- mean(costs$hold_cost_day, na.rm=TRUE)
+global_stock <- mean(costs$stockout_cost, na.rm=TRUE)
+
+costs <- tibble(sku_id=sku_list) %>% left_join(costs, by="sku_id") %>%
+  mutate(hold_cost_day=replace_na(hold_cost_day, global_hold),
+         stockout_cost=replace_na(stockout_cost, global_stock),
+         hold_cost_week=hold_cost_day*7) %>%
+  select(sku_id, hold_cost_week, stockout_cost)
+
+# initial inventory (WH)
+inv0 <- inv_snap %>% filter(location_id %in% c("WH_NORTH","WH_SOUTH")) %>% arrange(snapshot_date)
+first_date <- if (nrow(inv0)>0) min(inv0$snapshot_date) else NA
+inv0_by_sku <- inv_snap %>%
+  filter(location_id %in% c("WH_NORTH","WH_SOUTH"), snapshot_date==first_date) %>%
+  group_by(sku_id) %>% summarise(inv0=sum(on_hand_qty), .groups="drop")
+inv0_by_sku <- tibble(sku_id=sku_list) %>% left_join(inv0_by_sku, by="sku_id") %>% mutate(inv0=replace_na(inv0,0))
+
+W <- length(weeks); S <- length(sku_list); L <- length(line_list)
+n_x <- W*S*L; n_I <- W*S; n_B <- W*S; n_var <- n_x + n_I + n_B
+offset_I <- n_x; offset_B <- n_x + n_I
+
+mh_map <- unit_mh %>% deframe()
+hold_map <- costs %>% select(sku_id, hold_cost_week) %>% deframe()
+stock_map <- costs %>% select(sku_id, stockout_cost) %>% deframe()
+penalty_mat <- grid %>% mutate(key=paste0(week,"|",sku_id)) %>% select(key, avg_penalty) %>% deframe()
+demand_map  <- grid %>% mutate(key=paste0(week,"|",sku_id)) %>% select(key, demand_qty) %>% deframe()
+
+obj <- rep(0, n_var)
+for (w in seq_len(W)){
+  for (s in seq_len(S)){
+    sku <- sku_list[s]
+    obj[offset_I + (w-1)*S + s] <- hold_map[[sku]]
+    obj[offset_B + (w-1)*S + s] <- stock_map[[sku]] + penalty_mat[[paste0(weeks[w],"|",sku)]]
+  }
+}
+
+con_mat <- list(); con_dir <- c(); con_rhs <- c()
+
+# capacity
+for (w in seq_len(W)){
+  for (l in seq_len(L)){
+    row <- rep(0, n_var)
+    for (s in seq_len(S)){
+      pos <- (w-1)*S*L + (s-1)*L + l
+      row[pos] <- mh_map[[sku_list[s]]]
+    }
+    con_mat[[length(con_mat)+1]] <- row; con_dir <- c(con_dir, "<="); con_rhs <- c(con_rhs, cap_map[[line_list[l]]])
+  }
+}
+
+# ineligible x -> 0
+for (w in seq_len(W)){
+  for (s in seq_len(S)){
+    for (l in seq_len(L)){
+      sku <- sku_list[s]; line <- line_list[l]
+      if (!(paste0(sku,"|",line) %in% elig_set)){
+        pos <- (w-1)*S*L + (s-1)*L + l
+        row <- rep(0, n_var); row[pos] <- 1
+        con_mat[[length(con_mat)+1]] <- row; con_dir <- c(con_dir, "<="); con_rhs <- c(con_rhs, 0)
+      }
+    }
+  }
+}
+
+# balance
+for (w in seq_len(W)){
+  for (s in seq_len(S)){
+    row <- rep(0, n_var)
+    Ipos <- offset_I + (w-1)*S + s
+    Bpos <- offset_B + (w-1)*S + s
+    row[Ipos] <- 1; row[Bpos] <- -1
+
+    rhs0 <- 0
+    if (w > 1){
+      Iprev <- offset_I + (w-2)*S + s
+      Bprev <- offset_B + (w-2)*S + s
+      row[Iprev] <- -1; row[Bprev] <- 1
+    } else {
+      rhs0 <- inv0_by_sku$inv0[inv0_by_sku$sku_id==sku_list[s]]
+    }
+
+    for (l in seq_len(L)){
+      x_pos <- (w-1)*S*L + (s-1)*L + l
+      row[x_pos] <- row[x_pos] - 1
+    }
+
+    dem_qty <- demand_map[[paste0(weeks[w],"|",sku_list[s])]]
+    rhs <- if (w==1) (rhs0 - dem_qty) else (0 - dem_qty)
+
+    con_mat[[length(con_mat)+1]] <- row; con_dir <- c(con_dir, "="); con_rhs <- c(con_rhs, rhs)
+  }
+}
+con <- do.call(rbind, con_mat)
+
+sol <- lp(direction="min", objective.in=obj, const.mat=con, const.dir=con_dir, const.rhs=con_rhs, all.int=FALSE)
+stopifnot(sol$status==0)
+
+x_sol <- sol$solution[1:n_x]
+plan <- expand_grid(w=seq_len(W), s=seq_len(S), l=seq_len(L)) %>%
+  mutate(pos=(w-1)*S*L + (s-1)*L + l,
+         week=weeks[w],
+         sku_id=sku_list[s],
+         production_line_id=line_list[l],
+         planned_qty=x_sol[pos]) %>%
+  filter(planned_qty > 1e-6) %>%
+  mutate(planned_qty=round(planned_qty,0))
+
+lp_cost <- tibble(
+  total_objective = sol$objval,
+  holding_cost = sum(obj[(n_x+1):(n_x+n_I)] * sol$solution[(n_x+1):(n_x+n_I)]),
+  shortage_cost = sum(obj[(n_x+n_I+1):n_var] * sol$solution[(n_x+n_I+1):n_var])
+)
+
+write_csv(plan, file.path(base_dir, "optimization_outputs_r", "production_plan_weekly_lp.csv"))
+write_csv(lp_cost, file.path(base_dir, "optimization_outputs_r", "lp_cost_breakdown.csv"))
+```
+
+### Production plan insight: Which lines got leveled?
+
+```{r lp-plot}
+# Production LP results: show utilization/load by line with explicit legend (line IDs).
+# Fix legend: no generic series labels.
+
+plan_line_mh <- plan %>%
+  left_join(unit_mh, by="sku_id") %>%
+  mutate(required_mh = planned_qty * mh_per_unit) %>%
+  group_by(week, production_line_id) %>%
+  summarise(required_mh = sum(required_mh),
+            planned_units = sum(planned_qty), .groups="drop") %>%
+  mutate(week_dt = ymd(week),
+         week_ts = as.numeric(as.POSIXct(week_dt)) * 1000) %>%
+  left_join(lines_cap %>% select(production_line_id, weekly_capacity_machine_hours),
+            by="production_line_id") %>%
+  mutate(util = required_mh / weekly_capacity_machine_hours)
+
+# 1) Utilization by line
+hc1 <- highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Production LP — weekly utilization by line (machine-hours)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Utilization")) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+for (ln in sort(unique(plan_line_mh$production_line_id))){
+  d <- plan_line_mh %>%
+    filter(production_line_id == ln) %>%
+    transmute(x = week_ts, y = util) %>%
+    list_parse2()
+  hc1 <- hc1 %>% hc_add_series(data=d, type="line", name=ln)
+}
+hc1
+
+# 2) Load (machine-hours) by line
+hc2 <- highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Production LP — weekly required machine-hours by line") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Machine-hours")) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+for (ln in sort(unique(plan_line_mh$production_line_id))){
+  d <- plan_line_mh %>%
+    filter(production_line_id == ln) %>%
+    transmute(x = week_ts, y = required_mh) %>%
+    list_parse2()
+  hc2 <- hc2 %>% hc_add_series(data=d, type="line", name=ln)
+}
+hc2
+```
+
+## 5.3 Optimization 2 — Network Flow (WH → DC) with unmet slack
+
+If supply or lane capacity is insufficient, we allow **unmet demand** (with a big penalty) so the model stays feasible and the shortage is visible.
+
+```{r network-flow}
+lanes <- B$lanes %>%
+  filter(from_node %in% c("WH_NORTH","WH_SOUTH"),
+         str_detect(to_node, "^DC_")) %>%
+  mutate(weekly_capacity = capacity_units_per_day * 6)
+
+city_to_dc <- c("Hanoi"="DC_HN","Hai Phong"="DC_HN","Da Nang"="DC_DN","Nha Trang"="DC_DN","HCMC"="DC_HCMC","Can Tho"="DC_CT")
+dem2 <- B$dem %>%
+  left_join(B$customers %>% select(customer_id, city), by="customer_id") %>%
+  mutate(dc_id = city_to_dc[city],
+         week = format(floor_date(due_date, unit="week", week_start=1), "%Y-%m-%d"))
+
+weeks2 <- sort(unique(dem2$week))
+dcs <- sort(unique(dem2$dc_id))
+origins <- sort(unique(lanes$from_node))
+
+dem_dc <- dem2 %>% group_by(week, dc_id) %>% summarise(demand_units=sum(demand_qty), .groups="drop")
+
+# supply from LP (factory -> WH)
+lines2 <- B$lines %>% select(production_line_id, factory_id)
+plan_wh <- plan %>%
+  left_join(lines2, by="production_line_id") %>%
+  mutate(wh = if_else(factory_id=="F1","WH_NORTH","WH_SOUTH")) %>%
+  group_by(week, wh) %>%
+  summarise(supply_units = sum(planned_qty), .groups="drop") %>%
+  mutate(week = as.character(week))
+
+supply_grid <- expand_grid(week=weeks2, wh=origins) %>%
+  left_join(plan_wh, by=c("week","wh")) %>%
+  mutate(supply_units = replace_na(supply_units, 0))
+
+dem_grid <- expand_grid(week=weeks2, dc_id=dcs) %>%
+  left_join(dem_dc, by=c("week","dc_id")) %>%
+  mutate(demand_units = replace_na(demand_units, 0))
+
+out_rows <- list()
+cost_rows <- list()
+BIG_M <- 1e4
+
+for (wk in weeks2){
+  supply_wk <- supply_grid %>% filter(week==wk)
+  demand_wk <- dem_grid %>% filter(week==wk)
+
+  pairs <- expand_grid(from_node=origins, to_node=dcs) %>%
+    mutate(key=paste0(from_node,"|",to_node)) %>%
+    left_join(lanes %>% mutate(key=paste0(from_node,"|",to_node)) %>%
+                select(key, transport_cost_per_unit, weekly_capacity), by="key")
+
+  n_x <- nrow(pairs)
+  n_u <- length(dcs)
+  n <- n_x + n_u
+
+  obj <- c((pairs$transport_cost_per_unit %>% replace_na(1e6)), rep(BIG_M, n_u))
+  cap_vec <- pairs$weekly_capacity; cap_vec[is.na(cap_vec)] <- 0
+
+  con <- list(); dir <- c(); rhs <- c()
+
+  for (o in origins){
+    row <- rep(0,n); row[which(pairs$from_node==o)] <- 1
+    con[[length(con)+1]] <- row; dir <- c(dir, "<=")
+    rhs <- c(rhs, supply_wk$supply_units[supply_wk$wh==o])
+  }
+
+  for (i in seq_along(dcs)){
+    dc <- dcs[i]
+    row <- rep(0,n)
+    row[which(pairs$to_node==dc)] <- 1
+    row[n_x+i] <- 1
+    con[[length(con)+1]] <- row; dir <- c(dir, ">=")
+    rhs <- c(rhs, demand_wk$demand_units[demand_wk$dc_id==dc])
+  }
+
+  for (i in seq_len(n_x)){
+    row <- rep(0,n); row[i] <- 1
+    con[[length(con)+1]] <- row; dir <- c(dir, "<=")
+    rhs <- c(rhs, cap_vec[i])
+  }
+
+  con_mat <- do.call(rbind, con)
+  sol2 <- lp(direction="min", objective.in=obj, const.mat=con_mat, const.dir=dir, const.rhs=rhs, all.int=FALSE)
+  stopifnot(sol2$status==0)
+
+  x <- sol2$solution[1:n_x]
+  u <- sol2$solution[(n_x+1):n]
+
+  out_rows[[length(out_rows)+1]] <- pairs %>%
+    mutate(week=wk, ship_units=x) %>%
+    filter(ship_units > 1e-6) %>%
+    mutate(ship_units=round(ship_units,0))
+
+  cost_rows[[length(cost_rows)+1]] <- tibble(
+    week = wk,
+    transport_cost = sum((pairs$transport_cost_per_unit %>% replace_na(1e6)) * x),
+    unmet_units = sum(u)
+  )
+}
+
+flow_cost <- bind_rows(cost_rows) %>% mutate(week_dt = ymd(week))
+write_csv(flow_cost, file.path(base_dir, "optimization_outputs_r", "network_flow_cost_summary_weekly.csv"))
+```
+
+```{r flow-plot}
+flow_cost <- flow_cost %>%
+  mutate(week_ts = datetime_to_timestamp(as.POSIXct(week_dt))) %>%
+  arrange(week_dt)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Network Flow — transport cost (weekly)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Cost")) %>%
+  hc_add_series(flow_cost, "line",
+                hcaes(x=week_ts, y=transport_cost),
+                color=COL_BEFORE, name="Cost") %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Network Flow — unmet demand units (weekly)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Units")) %>%
+  hc_add_series(flow_cost, "column",
+                hcaes(x=week_ts, y=unmet_units),
+                color=COL_BAD, name="Unmet", opacity=0.6) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+```
+
+# 6) Only now: Compare BEFORE vs AFTER (impact)
+
+We use the same measurement logic on both scenarios, but we compare *after we know what we are fixing*.
+
+```{r compare-metrics}
+compute_weekly <- function(x){
+  prod <- x$prod %>% mutate(
+    cycle_min = as.numeric(difftime(step_end_time, step_start_time, units="mins")),
+    week = as.Date(floor_date(step_start_time, "week", week_start=1))
+  ) %>% arrange(work_order_id, step_start_time) %>%
+    group_by(work_order_id) %>%
+    mutate(prev_end = lag(step_end_time),
+           wait_min = pmax(0, as.numeric(difftime(step_start_time, prev_end, units="mins")))) %>%
+    ungroup()
+
+  prod %>% group_by(week) %>%
+    summarise(
+      produced_qty=sum(produced_qty),
+      rejected_qty=sum(rejected_qty),
+      rework_qty=sum(rework_qty),
+      avg_wait=mean(wait_min, na.rm=TRUE),
+      avg_cycle=mean(cycle_min, na.rm=TRUE),
+      p95_cycle=quantile(cycle_min, 0.95, na.rm=TRUE),
+      .groups="drop"
+    ) %>% mutate(scenario=x$scenario)
+}
+
+cmp <- bind_rows(compute_weekly(B), compute_weekly(A)) %>%
+  mutate(week_ts = datetime_to_timestamp(as.POSIXct(week))) %>%
+  arrange(week)
+
+# Interactive compare charts (use week_ts for datetime axis)
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Impact — Throughput (Before vs After)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Units")) %>%
+  hc_add_series(cmp %>% filter(scenario=="before"), "line",
+                hcaes(x=week_ts, y=produced_qty),
+                name="before", color=COL_BEFORE) %>%
+  hc_add_series(cmp %>% filter(scenario=="after"),  "line",
+                hcaes(x=week_ts, y=produced_qty),
+                name="after",  color=COL_AFTER) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+highchart() %>%
+  hc_chart(zoomType="x") %>%
+  hc_title(text="Impact — Waiting time (Before vs After)") %>%
+  hc_xAxis(type="datetime") %>%
+  hc_yAxis(title=list(text="Minutes")) %>%
+  hc_add_series(cmp %>% filter(scenario=="before"), "line",
+                hcaes(x=week_ts, y=avg_wait),
+                name="before", color=COL_BEFORE) %>%
+  hc_add_series(cmp %>% filter(scenario=="after"),  "line",
+                hcaes(x=week_ts, y=avg_wait),
+                name="after",  color=COL_AFTER) %>%
+  hc_tooltip(shared=TRUE, crosshairs=TRUE) %>%
+  hc_exporting(enabled = TRUE) %>%
+  hc_lang_safe(hc_lang)
+
+```
+
+# 7) Closing: the storyline in one paragraph
+
+- Baseline evidence points to **queueing/waiting concentrated in specific steps**, confirmed by **high utilization lines** and **quality Pareto**.
+- Lean countermeasures reduce variability and rework at the source; optimization turns that into **capacity-feasible weekly plans** and **cost-aware shipments**.
+- Only after diagnosing the root cause do we compare results — and the improvement becomes credible, not “dashboard theatre”.

@@ -1,0 +1,3 @@
+factory_id,factory_name,country,region,timezone
+F1,CompanyA_Factory_North,VN,North,Asia/Ho_Chi_Minh
+F2,CompanyA_Factory_South,VN,South,Asia/Ho_Chi_Minh
