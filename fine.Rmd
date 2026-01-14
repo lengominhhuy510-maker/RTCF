@@ -1,0 +1,1196 @@
+---
+title: "VSCC Challenge C — KPI Closing Dashboard (Visual Upgrade)"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_depth: 2
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+options(scipen = 999)
+options(highcharter.theme = NULL)
+```
+
+## 1) Libraries & Helpers
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(lubridate)
+library(highcharter)
+library(DT)
+library(scales)
+library(purrr)
+
+file_path <- "[VSCC 2026] CHALLENGE C - BUSINESS CASE (DATASET).xlsx"
+
+read_clean <- function(sheet){
+  readxl::read_excel(file_path, sheet = sheet) %>%
+    janitor::clean_names()
+}
+
+# EU number parser: "50.003.625" -> 50003625 ; "1451614,52" -> 1451614.52
+eu_to_num <- function(x){
+  x <- as.character(x)
+  x <- str_squish(x)
+  x <- na_if(x, "")
+  x <- str_replace_all(x, "\\.", "")
+  x <- str_replace_all(x, ",", ".")
+  suppressWarnings(as.numeric(x))
+}
+
+# Weighted mean helper
+wmean <- function(x, w) sum(x * w, na.rm = TRUE) / sum(w, na.rm = TRUE)
+
+# ---- VSCC palette (calm, CEO friendly) ----
+COL_NAVY   <- "#2C3E50"
+COL_BLUE <- "#2563EB"
+COL_BLUE_L <- "#DBEAFE"
+COL_GRAY_L <- "#E5E7EB"
+COL_TEAL <- "#14B8A6"
+COL_WARN   <- "#F1C40F"
+COL_BAD    <- "#EF4444"  # softer than pure red/pink
+# Aliases used by charts
+clr_navy <- COL_NAVY
+clr_blue <- COL_BLUE
+clr_teal <- COL_TEAL
+clr_green  <- "#22C55E"
+clr_yellow <- COL_WARN
+clr_red    <- COL_BAD
+clr_gray   <- "#6B7280"
+
+# Heatmap palette (blue-white dominant)
+clr_blue_dark <- "#1E3A8A"
+clr_blue_mid  <- "#93C5FD"
+clr_blue_pale <- "#EFF6FF"
+
+hex_to_rgba <- function(hex, alpha = 1) {
+  hex <- gsub("#", "", hex)
+  r <- strtoi(substr(hex, 1, 2), 16L)
+  g <- strtoi(substr(hex, 3, 4), 16L)
+  b <- strtoi(substr(hex, 5, 6), 16L)
+  sprintf("rgba(%d,%d,%d,%.3f)", r, g, b, alpha)
+}
+
+hc_theme_vscc <- function(){
+  hc_theme(
+    chart = list(backgroundColor = "#ffffff",
+                 style = list(fontFamily = "Inter, Segoe UI, Arial")),
+    title = list(style = list(color = clr_navy, fontWeight = "600")),
+    subtitle = list(style = list(color = clr_gray)),
+    xAxis = list(
+      gridLineColor = "#f3f4f6",
+      lineColor = "#e5e7eb",
+      tickColor = "#e5e7eb",
+      labels = list(style = list(color = clr_gray)),
+      title = list(style = list(color = clr_gray))
+    ),
+    yAxis = list(
+      gridLineColor = "#f3f4f6",
+      labels = list(style = list(color = clr_gray)),
+      title = list(style = list(color = clr_gray))
+    ),
+    legend = list(itemStyle = list(color = clr_gray)),
+    colors = c(clr_blue, clr_teal, clr_yellow, clr_red)
+  )
+}
+# options(highcharter.theme = hc_theme_vscc())  # disabled: set styling/colors per-chart
+# Soft traffic-light by quantile (pastel), returns rgba
+kpi_colors_quantile <- function(x, direction = c("high_good","low_good"),
+                                p = c(0.33, 0.66), alpha = 0.85) {
+  direction <- match.arg(direction)
+  q <- stats::quantile(x, probs = p, na.rm = TRUE, names = FALSE)
+  if (direction == "high_good") {
+    dplyr::case_when(
+      x < q[1] ~ hex_to_rgba(clr_red, alpha),
+      x < q[2] ~ hex_to_rgba(clr_yellow, alpha),
+      TRUE ~ hex_to_rgba(clr_green, alpha)
+    )
+  } else {
+    dplyr::case_when(
+      x < q[1] ~ hex_to_rgba(clr_green, alpha),
+      x < q[2] ~ hex_to_rgba(clr_yellow, alpha),
+      TRUE ~ hex_to_rgba(clr_red, alpha)
+    )
+  }
+}
+# Alias used in some earlier snippets
+kpi_tlight <- function(x, direction = c("high_good","low_good")) {
+  direction <- match.arg(direction)
+  kpi_colors_quantile(x, direction = direction)
+}
+```
+
+## 2) Load Data
+
+```{r}
+product_master    <- read_clean("ProductMaster")
+country_master    <- read_clean("CountryMaster") %>%
+  select(country_code, country_name, region, domestic_flag, currency)
+supplier_master   <- read_clean("SupplierMaster")
+supplier_material <- read_clean("SupplierMaterial")
+port24            <- read_clean("Port24_Historical")
+port25            <- read_clean("Port25_Historical")
+dev26             <- read_clean("Dev26_Potential FCST")
+financial_view    <- read_clean("FinancialView")
+
+# PnL: read as text to avoid Excel locale/format traps
+pnl_raw <- read_excel(
+  file_path,
+  sheet = "PnL_FY2024",
+  col_types = c("text", "text", "text", "text")
+) %>% clean_names()
+
+# Be robust to label column name (some versions become pn_l_usd after clean_names())
+label_col <- names(pnl_raw)[1]
+pnl <- pnl_raw %>%
+  mutate(
+    fy2024 = eu_to_num(fy2024),
+    fy2025 = eu_to_num(fy2025),
+    fy2026_projected = eu_to_num(fy2026_projected)
+  ) %>%
+  rename(pnl_usd = all_of(label_col))
+```
+
+## 3) Data Cleaning & Normalization (keep your flow)
+
+```{r}
+# FX missing: USD rows => 1
+port24 <- port24 %>%
+  mutate(fx_rate_to_usd = if_else(currency == "USD" & is.na(fx_rate_to_usd), 1, fx_rate_to_usd))
+
+port25 <- port25 %>%
+  mutate(fx_rate_to_usd = if_else(currency == "USD" & is.na(fx_rate_to_usd), 1, fx_rate_to_usd))
+
+sales_raw <- bind_rows(
+  port24 %>% mutate(src_year = 2024),
+  port25 %>% mutate(src_year = 2025)
+) %>%
+  mutate(
+    req_ship_date = as.Date(req_ship_date),
+    year = if_else(!is.na(year_tmp), as.integer(year_tmp), year(req_ship_date)),
+    discount_rate = as.numeric(discount_rate),
+    gm_percent    = as.numeric(gm_percent),
+    otif_percent  = as.numeric(otif_percent),
+    sales_usd     = as.numeric(sales_usd),
+    sales_units   = as.numeric(sales_units)
+  )
+
+# Cost-to-serve: Outbound logistics per unit by country
+cts <- financial_view %>%
+  filter(x2026_revenue_mix_targets %in% c("VN","DE","FR","ES","NL","US","TH","SG","MY")) %>%
+  transmute(
+    country_code = x2026_revenue_mix_targets,
+    logistics_cost_perunit_usd = as.numeric(str_replace_all(as.character(x2), ",", ".")),
+    cost_nature = x3,
+    remarks = x4
+  )
+
+fact_sales <- sales_raw %>%
+  left_join(country_master, by = "country_code") %>%
+  left_join(product_master %>% select(sku, cogs_usd, std_prod_lead_time_days), by = "sku") %>%
+  left_join(cts, by = "country_code") %>%
+  mutate(
+    list_sales_usd = if_else(!is.na(discount_rate) & discount_rate < 1,
+                             sales_usd / (1 - discount_rate), NA_real_),
+    discount_value_usd = list_sales_usd - sales_usd,
+    gross_profit_usd = sales_usd * gm_percent,
+    logistics_cost_usd = sales_units * logistics_cost_perunit_usd
+  )
+```
+
+## 4) KPI Computation Blocks (define everything BEFORE charts)
+
+```{r}
+# --- Core KPIs ---
+kpi_year <- fact_sales %>%
+  group_by(year) %>%
+  summarise(
+    net_sales = sum(sales_usd, na.rm = TRUE),
+    gm_pct_w  = wmean(gm_percent, sales_usd),
+    disc_w    = wmean(discount_rate, sales_usd),
+    otif_w    = wmean(otif_percent, sales_usd),
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+kpi_country <- fact_sales %>%
+  group_by(country_code) %>%
+  summarise(
+    net_sales = sum(sales_usd, na.rm = TRUE),
+    gm_pct_w  = wmean(gm_percent, sales_usd),
+    disc_w    = wmean(discount_rate, sales_usd),
+    otif_w    = wmean(otif_percent, sales_usd),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(net_sales))
+
+top10 <- kpi_country %>% slice_head(n = 10)
+
+# --- Supply + Working capital proxies ---
+parse_terms_days <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  d <- case_when(
+    is.na(x) ~ NA_real_,
+    str_detect(x, "net\\s*\\d+") ~ as.numeric(str_extract(x, "\\d+")),
+    str_detect(x, "\\bn\\s*\\d+\\b") ~ as.numeric(str_extract(x, "\\d+")),
+    str_detect(x, "cod|immediate|due on receipt|prepay|advance") ~ 0,
+    TRUE ~ NA_real_
+  )
+  d
+}
+
+fact_supply <- supplier_material %>%
+  mutate(
+    moq_per_order = as.numeric(moq_per_order),
+    production_lt_days = as.numeric(production_lt_days),
+    unit_price = as.numeric(unit_price),
+    overhead_fee_pct = as.numeric(overhead_fee_pct)
+  ) %>%
+  left_join(
+    supplier_master %>%
+      mutate(supplier_terms_days = parse_terms_days(payment_terms)) %>%
+      select(supplier_id, supplier_country, payment_terms, supplier_terms_days,
+             overall_supplier_score, preferred_supplier_flag, core_supplier_flag),
+    by = "supplier_id"
+  ) %>%
+  mutate(
+    is_china = supplier_country %in% c("CN","CHINA"),
+    is_active = active_usage_flag == "Y"
+  )
+
+compliance_mix <- fact_supply %>%
+  filter(is_active) %>%
+  count(compliance_status) %>%
+  mutate(pct = n / sum(n)) %>%
+  arrange(desc(n))
+
+china_exposure <- fact_supply %>%
+  filter(is_active) %>%
+  summarise(
+    active_materials = n(),
+    china_materials = sum(is_china, na.rm = TRUE),
+    pct_china = china_materials / active_materials
+  )
+
+supplier_readiness <- fact_supply %>%
+  filter(is_active) %>%
+  distinct(supplier_id, supplier_country, is_china, overall_supplier_score) %>%
+  summarise(
+    suppliers = n(),
+    avg_score = mean(overall_supplier_score, na.rm = TRUE),
+    pct_score_ge4 = mean(overall_supplier_score >= 4, na.rm = TRUE),
+    .by = is_china
+  )
+
+pressure_tbl <- fact_supply %>%
+  filter(is_active) %>%
+  mutate(pressure_raw = moq_per_order * production_lt_days) %>%
+  arrange(desc(pressure_raw)) %>%
+  select(material_code, supplier_id, supplier_country, compliance_status,
+         moq_per_order, production_lt_days, pressure_raw) %>%
+  slice_head(n = 50)
+
+# Payment terms mismatch proxy (cash gap)
+fact_sales <- fact_sales %>% mutate(customer_terms_days = parse_terms_days(payment_terms))
+
+sup_terms_ref <- fact_supply %>%
+  filter(is_active) %>%
+  summarise(sup_terms_avg = mean(supplier_terms_days, na.rm = TRUE)) %>%
+  pull(sup_terms_avg)
+
+cash_gap_market <- fact_sales %>%
+  group_by(country_code) %>%
+  summarise(
+    net_sales = sum(sales_usd, na.rm = TRUE),
+    cust_terms_w = wmean(customer_terms_days, sales_usd),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    supplier_terms_ref = sup_terms_ref,
+    cash_gap_days = cust_terms_w - supplier_terms_ref,
+    cash_tied_proxy = (net_sales / 365) * cash_gap_days
+  ) %>%
+  arrange(desc(cash_tied_proxy))
+
+# Cost-to-serve ratio
+kpi_cts <- fact_sales %>%
+  group_by(country_code) %>%
+  summarise(
+    net_sales = sum(sales_usd, na.rm = TRUE),
+    logistics_cost = sum(logistics_cost_usd, na.rm = TRUE),
+    cts_per_sales = logistics_cost / net_sales,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(net_sales))
+
+# Time-to-market (core): weighted production lead time
+ttm_core_market <- fact_sales %>%
+  group_by(country_code) %>%
+  summarise(
+    net_sales = sum(sales_usd, na.rm = TRUE),
+    ttm_prod_w = sum(std_prod_lead_time_days * sales_usd, na.rm = TRUE) / sum(sales_usd, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(net_sales))
+
+# CEO stack (percent points, ready for charts)
+ceo_stack2 <- kpi_cts %>%
+  left_join(kpi_country %>% select(country_code, gm_pct_w, disc_w, otif_w), by = "country_code") %>%
+  left_join(cash_gap_market %>% select(country_code, cash_gap_days, cash_tied_proxy, cust_terms_w, supplier_terms_ref),
+            by = "country_code") %>%
+  left_join(ttm_core_market %>% select(country_code, ttm_prod_w), by = "country_code") %>%
+  mutate(
+    gm_pct_w = gm_pct_w * 100,
+    disc_w = disc_w * 100,
+    otif_w = otif_w * 100,
+    cts_per_sales = cts_per_sales * 100
+  ) %>%
+  select(country_code, net_sales, gm_pct_w, disc_w, otif_w, cts_per_sales,
+         cash_gap_days, cash_tied_proxy, cust_terms_w, supplier_terms_ref, ttm_prod_w)
+
+# Contribution proxy (for drilldown)
+market_profit <- fact_sales %>%
+  group_by(country_code) %>%
+  summarise(
+    net_sales = sum(sales_usd, na.rm = TRUE),
+    gross_profit = sum(gross_profit_usd, na.rm = TRUE),
+    logistics_cost = sum(logistics_cost_usd, na.rm = TRUE),
+    contrib_profit = gross_profit - logistics_cost,
+    contrib_margin_pct = contrib_profit / net_sales,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(net_sales))
+```
+
+## 5) Executive Dashboard Visuals
+
+### 5.1 Net Sales by Year
+
+```{r}
+ns_year <- fact_sales %>%
+  group_by(year) %>%
+  summarise(net_sales = sum(sales_usd, na.rm = TRUE), .groups = "drop") %>%
+  arrange(year)
+
+hc_51 <- hchart(ns_year, "column", hcaes(x = year, y = net_sales)) %>%
+  hc_title(text = "Net Sales by Year") %>%
+  hc_chart(backgroundColor = "#FFFFFF") %>%
+  hc_xAxis(title = list(text = "Year")) %>%
+  hc_yAxis(title = list(text = "Net sales ($)"), labels = list(format = "${value:,.0f}"),
+           gridLineWidth = 1, gridLineColor = "#EEF2F7") %>%
+  hc_plotOptions(
+    column = list(
+      borderRadius = 4,
+      color = clr_blue,
+      dataLabels = list(enabled = TRUE, format = "${point.y:,.0f}")
+    )
+  ) %>%
+  hc_tooltip(pointFormat = "<b>${point.y:,.0f}</b>") %>%
+  hc_credits(enabled = FALSE)
+
+hc_51
+```
+
+### 5.2 Trend (2024→2025): Sales index & GM (pp)
+
+```{r}
+# Trend (2024→2025): Sales index (2024=100) & GM (pp)
+trend <- fact_sales %>%
+  group_by(year) %>%
+  summarise(
+    sales = sum(sales_usd, na.rm = TRUE),
+    gm_pp = weighted.mean(gm_percent * 100, w = sales_usd, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(year) %>%
+  mutate(
+    sales_index = sales / first(sales) * 100
+  )
+
+hc_52 <- highchart() %>%
+  hc_chart(type = "line", backgroundColor = "#FFFFFF") %>%
+  hc_title(text = "Trend: Sales index (2024=100) & GM (pp)") %>%
+  hc_xAxis(categories = trend$year, title = list(text = NULL)) %>%
+  hc_yAxis_multiples(
+    list(title = list(text = "Sales index"), min = min(trend$sales_index, na.rm = TRUE) * 0.95,
+         gridLineWidth = 1, gridLineColor = "#EEF2F7"),
+    list(title = list(text = "GM (pp)"), opposite = TRUE, labels = list(format = "{value}%"))
+  ) %>%
+  hc_add_series(name = "Sales index", data = round(trend$sales_index, 1), yAxis = 0,
+                color = clr_blue, marker = list(symbol = "circle")) %>%
+  hc_add_series(name = "GM (pp)", data = round(trend$gm_pp, 2), yAxis = 1,
+                color = clr_teal, marker = list(symbol = "diamond")) %>%
+  hc_tooltip(shared = TRUE, valueDecimals = 2) %>%
+  hc_credits(enabled = FALSE)
+
+hc_52
+```
+
+### 5.3 Compliance mix (traffic-light) + drilldown by impact
+
+```{r}
+comp_df <- compliance_mix %>%
+  mutate(pct100 = pct * 100,
+         color = kpi_colors_quantile(pct100, "high_good"))
+
+if (all(c("compliance_status","compliance_impact") %in% names(fact_supply))) {
+  comp_dd <- fact_supply %>%
+    filter(is_active) %>%
+    count(compliance_status, compliance_impact) %>%
+    group_by(compliance_status) %>%
+    mutate(pct = n / sum(n)) %>%
+    ungroup()
+
+  comp_main <- comp_df %>% mutate(drilldown = compliance_status)
+
+  dd_series <- comp_dd %>%
+    group_by(compliance_status) %>%
+    summarise(
+      data = list(purrr::map2(coalesce(compliance_impact, "No extra impact"), pct*100,
+                              ~list(name=.x, y=.y))),
+      .groups="drop"
+    ) %>%
+    transmute(
+      id = compliance_status,
+      name = paste0("Impact within: ", compliance_status),
+      data = data,
+      type = "bar"
+    )
+
+  highchart() %>%
+    hc_chart(type = "column") %>%
+    hc_title(text = "Compliance Mix (Active) → Drilldown by Impact") %>%
+    hc_xAxis(type = "category") %>%
+    hc_add_series(
+      name = "Status",
+      data = purrr::pmap(list(comp_main$compliance_status, comp_main$pct100, comp_main$color, comp_main$drilldown),
+                         ~list(name=..1, y=..2, color=..3, drilldown=..4))
+    ) %>%
+    hc_yAxis(title = list(text = "% of active materials"), labels = list(format = "{value}%")) %>%
+    hc_tooltip(pointFormat = "<b>{point.y:.1f}%</b><br/>Click to drill down") %>%
+    hc_drilldown(series = list_parse(dd_series)) %>%
+    hc_add_theme(hc_theme_vscc())
+} else {
+  hchart(comp_df, "column", hcaes(x = compliance_status, y = pct100, color = color)) %>%
+    hc_title(text = "Compliance Mix (Active)") %>%
+    hc_yAxis(title = list(text = "% of active materials"), labels = list(format = "{value}%")) %>%
+    hc_plotOptions(series = list(colorByPoint = TRUE)) %>%
+    hc_tooltip(pointFormat = "<b>{point.y:.1f}%</b>") %>%
+    hc_add_theme(hc_theme_vscc())
+}
+```
+
+### 5.4 China-origin exposure
+
+```{r}
+china_df <- tibble(
+  metric = "China-origin exposure (active materials)",
+  pct = china_exposure$pct_china * 100
+) %>%
+  mutate(
+    color = case_when(
+      pct <= 10 ~ clr_green,
+      pct <= 20 ~ clr_yellow,
+      TRUE ~ clr_red
+    )
+  )
+
+china_points <- china_df %>%
+  transmute(name = metric, y = pct, color = color)
+
+highchart() %>%
+  hc_chart(type = "column") %>%
+  hc_title(text = "China-origin Exposure") %>%
+  hc_xAxis(type = "category", title = list(text = "")) %>%
+  hc_add_series(name = "Exposure", data = list_parse2(china_points), showInLegend = FALSE) %>%
+  hc_yAxis(title = list(text = "%"), labels = list(format = "{value:.0f}%"), max = 100) %>%
+  hc_plotOptions(series = list(borderWidth = 0, dataLabels = list(enabled = TRUE, format = "{point.y:.1f}%"))) %>%
+  hc_tooltip(pointFormat = "<b>{point.y:.1f}%</b>") %>%
+  hc_add_theme(hc_theme_vscc())
+```
+
+### 5.5 Payment terms mismatch (Customer vs Supplier) — cash gap by market (HERO)
+
+```{r}
+# Show BOTH absolute terms and the mismatch (gap) clearly:
+# - Columns: customer terms vs supplier ref
+# - Line (secondary axis): cash gap days (traffic-light by risk)
+
+cg <- cash_gap_market %>%
+  mutate(
+    gap = cash_gap_days,
+    gap_color = case_when(
+      gap <= 0 ~ clr_green,
+      gap <= 10 ~ clr_yellow,
+      TRUE ~ clr_red
+    )
+  ) %>%
+  arrange(desc(cash_tied_proxy))
+
+highchart() %>%
+  hc_title(text = "Payment Terms Mismatch by Market (Customer vs Supplier)") %>%
+  hc_xAxis(categories = cg$country_code, title = list(text = "")) %>%
+  hc_yAxis_multiples(
+    list(title = list(text = "Days (payment terms)"), labels = list(format = "{value:.0f}")),
+    list(title = list(text = "Cash gap (days)"), labels = list(format = "{value:.0f}"), opposite = TRUE)
+  ) %>%
+  hc_add_series(
+    name = "Supplier terms (ref)",
+    type = "column",
+    data = cg$supplier_terms_ref,
+    color = COL_GRAY_L
+  ) %>%
+  hc_add_series(
+    name = "Customer terms (w.avg)",
+    type = "column",
+    data = cg$cust_terms_w,
+    color = clr_blue
+  ) %>%
+  hc_add_series(
+    name = "Cash gap (cust - supp)",
+    type = "spline",
+    yAxis = 1,
+    data = list_parse(cg %>% transmute(y = gap, color = gap_color, cash = cash_tied_proxy)),
+    color = clr_red,
+    marker = list(enabled = TRUE, radius = 4)
+  ) %>%
+  hc_tooltip(
+    shared = TRUE,
+    useHTML = TRUE,
+    formatter = JS(
+      "function(){
+        var out = '<b>' + this.x + '</b><br/>';
+        this.points.forEach(function(p){
+          out += '<span style=\"color:' + p.color + '\">●</span> ' + p.series.name + ': <b>' + Highcharts.numberFormat(p.y, 1) + '</b> days<br/>';
+          if(p.point && p.point.cash && p.series.name.indexOf('Cash gap') >= 0){
+            out += 'Cash tied proxy: <b>$' + Highcharts.numberFormat(p.point.cash, 0) + '</b><br/>';
+          }
+        });
+        return out;
+      }"
+    )
+  ) %>%
+  hc_add_theme(hc_theme_vscc())
+```
+
+### 5.6 MOQ × Lead Time pressure (HERO)
+
+```{r}
+# HERO bubble (materials):
+#   x = Production lead time (days)
+#   y = MOQ per order
+#   size (z) = Pressure raw = MOQ × Lead time
+#   colorAxis = Cash tied proxy = MOQ × Unit price (USD)
+#   outline = Compliance status
+#   label = only show "CRITICAL" when (compliance != Yes) & (cash tied >= $3k)
+
+# Build base table (use ONLY dataset fields; no synthetic numbers)
+pressure_tbl <- fact_supply %>%
+  filter(is_active) %>%
+  transmute(
+    material_code,
+    material_name,
+    supplier_id,
+    supplier_country,
+    compliance_status,
+    moq_per_order = as.numeric(moq_per_order),
+    production_lt_days = as.numeric(production_lt_days),
+    unit_price = as.numeric(unit_price)
+  ) %>%
+  mutate(
+    pressure_raw = moq_per_order * production_lt_days,
+    cash_tied = moq_per_order * unit_price,
+    is_critical = (compliance_status != "Yes") & !is.na(cash_tied) & cash_tied >= 3000
+  ) %>%
+  filter(!is.na(moq_per_order), !is.na(production_lt_days), !is.na(pressure_raw)) %>%
+  arrange(desc(pressure_raw))
+
+# Keep chart readable
+p_show <- pressure_tbl %>% slice_head(n = 50) %>%
+  mutate(
+    outline_col = case_when(
+      compliance_status == "Yes" ~ clr_green,
+      compliance_status == "Partial" ~ clr_yellow,
+      compliance_status == "No" ~ clr_red,
+      TRUE ~ COL_GRAY_L
+    ),
+    outline_w = if_else(is_critical, 3, 2)
+  )
+
+# Build points explicitly to avoid "undefined" in Highcharts
+bubble_56_points <- purrr::pmap(
+  p_show,
+  function(material_code, material_name, supplier_id, supplier_country, compliance_status,
+           moq_per_order, production_lt_days, unit_price, pressure_raw, cash_tied, is_critical,
+           outline_col, outline_w, ...) {
+    list(
+      x = production_lt_days,
+      y = moq_per_order,
+      z = pressure_raw,
+      cash_tied = cash_tied,
+      material_code = material_code,
+      material_name = material_name,
+      supplier_id = supplier_id,
+      supplier_country = supplier_country,
+      compliance_status = compliance_status,
+      unit_price = unit_price,
+      is_critical = is_critical,
+      marker = list(lineColor = outline_col, lineWidth = outline_w)
+    )
+  }
+)
+
+cash_max <- suppressWarnings(max(p_show$cash_tied, na.rm = TRUE))
+if (!is.finite(cash_max) || cash_max <= 0) cash_max <- 1
+
+highchart() %>%
+  hc_title(text = "MOQ × Lead Time pressure (HERO)") %>%
+  hc_subtitle(text = "Size = Pressure | Color = Capital Tied | Outline = Compliance Status") %>%
+  hc_chart(type = "bubble", zoomType = "xy", backgroundColor = "#FFFFFF") %>%
+  hc_xAxis(
+    title = list(text = "Production lead time (days)"),
+    gridLineWidth = 1, gridLineColor = "#F3F4F6",
+    plotLines = list(list(value = 14, color = "#94A3B8", dashStyle = "Dash", width = 1))
+  ) %>%
+  hc_yAxis(
+    title = list(text = "MOQ per order"),
+    gridLineWidth = 1, gridLineColor = "#F3F4F6"
+  ) %>%
+  hc_colorAxis(
+    min = 0, max = cash_max,
+    # Dùng dải màu Blue-Slate chuyên nghiệp, tránh màu quá tươi gây 'quê'
+    stops = list(
+      list(0, "#DBEAFE"),   # Xanh rất nhạt
+      list(0.5, "#3B82F6"), # Blue chuẩn
+      list(1, "#1E3A8A")    # Navy đậm
+    ),
+    labels = list(format = "${value:,.0f}"),
+    title = list(text = "Cash tied (USD)")
+  ) %>%
+  hc_add_series(
+    name = "Materials",
+    data = bubble_56_points,
+    colorKey = "cash_tied",
+    # Loại bỏ viền trắng mặc định của Highcharts để lộ rõ viền Compliance
+    marker = list(fillOpacity = 0.85, lineWidth = 2) 
+  ) %>%
+  hc_plotOptions(
+    bubble = list(
+      minSize = 10, maxSize = 75, # Tăng nhẹ size để dễ quan sát
+      dataLabels = list(
+        enabled = TRUE,
+        allowOverlap = TRUE,
+        formatter = JS("function(){ 
+          return this.point.is_critical ? 
+          '<span style=\"color:#EF4444; background-color: rgba(255,255,255,0.7); padding: 2px; border-radius:3px;\">⚠️ CRITICAL</span>' : ''; 
+        }"),
+        useHTML = TRUE, # Bật HTML để dùng style background cho nhãn
+        style = list(fontWeight = "bold", textOutline = "1px white")
+      )
+    )
+  ) %>%
+  hc_tooltip(
+    useHTML = TRUE,
+    formatter = JS("function(){ var p=this.point||{};var code=p.material_code||'N/A';var origin=p.supplier_country||'N/A';var mname=p.material_name||'';var supp=p.supplier_id||'N/A';var comp=p.compliance_status||'N/A';var moq=p.y; var lt=p.x; var pressure=p.z;var up=p.unit_price; var cash=p.cash_tied;var crit=p.is_critical ? 'CRITICAL' : '';return '<b>'+code+'</b> ('+origin+') ' + (crit ? '<span style=\"color:#EF4444\">['+crit+']</span>' : '') + '<br/>' + (mname ? '<span style=\"color:#64748B\">'+mname+'</span><br/>' : '') + 'Supplier: <b>'+supp+'</b><br/>' + 'Compliance: <b>'+comp+'</b><br/>' + 'MOQ: <b>'+Highcharts.numberFormat(moq,0)+'</b> | LT: <b>'+Highcharts.numberFormat(lt,0)+' days</b><br/>' + 'Pressure (MOQ×LT): <b>'+Highcharts.numberFormat(pressure,0)+'</b><br/>' + 'Unit price: <b>$'+(up==null ? 'NA' : Highcharts.numberFormat(up,2))+'</b><br/>' + 'Cash tied (MOQ×Unit price): <b>$'+(cash==null ? 'NA' : Highcharts.numberFormat(cash,0))+'</b>';}")
+  ) %>%
+  hc_add_theme(hc_theme_vscc())
+
+# ---- Top 20 priority list (by cash tied) ----
+p_top20_priority <- pressure_tbl %>%
+  mutate(
+    # Phân loại rủi ro ròng theo logic code (1)
+    risk_tag = case_when(
+      is_critical ~ "CRITICAL",                # Partial/No + Cash >= 3k
+      compliance_status != "Yes" ~ "WATCH",     # Partial/No nhưng Cash < 3k
+      TRUE ~ "OK"
+    ),
+    label = paste0(material_code, " (", supplier_country, ")"),
+    # Màu sắc cột dựa trên Risk Tag
+    bar_col = case_when(
+      risk_tag == "CRITICAL" ~ clr_red,
+      risk_tag == "WATCH"    ~ clr_yellow,
+      TRUE                   ~ clr_green
+    )
+  ) %>%
+  # SẮP XẾP THEO TIỀN KẸT (đúng ý đồ CEO-friendly của code 1)
+  arrange(desc(cash_tied)) %>% 
+  slice_head(n = 20)
+
+# Build points explicitly
+bar_56_points <- purrr::pmap(
+  p_top20_priority,
+  function(material_code, material_name, supplier_id, supplier_country, compliance_status,
+           moq_per_order, production_lt_days, unit_price, pressure_raw, cash_tied, 
+           risk_tag, label, bar_col, ...) {
+    list(
+      name = label,
+      y = cash_tied,         # Trục Y thể hiện Tiền bị kẹt
+      color = bar_col,
+      pressure = pressure_raw,
+      material_code = material_code,
+      supplier_id = supplier_id,
+      compliance = compliance_status,
+      risk_tag = risk_tag,
+      unit_price = unit_price
+    )
+  }
+)
+
+highchart() %>%
+  hc_chart(type = "bar", backgroundColor = "#FFFFFF") %>%
+  hc_title(text = "Top 20 Capital Tied Materials (Priority List)") %>%
+  hc_subtitle(text = "Sorted by Cash Tied | Color = Risk Tag (CRITICAL/WATCH/OK)") %>%
+  hc_xAxis(type = "category", title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Cash Tied Proxy ($)"), labels = list(format = "${value:,.0f}")) %>%
+  hc_add_series(
+    name = "Cash Tied", 
+    data = bar_56_points, 
+    showInLegend = FALSE,
+    dataLabels = list(enabled = TRUE, format = "${point.y:,.0f}")
+  ) %>%
+  hc_tooltip(
+    useHTML = TRUE,
+    formatter = JS(sprintf("
+function(){
+  var p = this.point || {};
+  var risk_col = (p.risk_tag === 'CRITICAL') ? '%s' : ((p.risk_tag === 'WATCH') ? '%s' : '#64748B');
+
+  return '<b>' + p.material_code + '</b><br/>' +
+         'Risk Priority: <span style=\"color:' + risk_col + '; font-weight:bold;\">' + p.risk_tag + '</span><br/>' +
+         'Compliance: <b>' + p.compliance + '</b><br/>' +
+         'Supplier: ' + p.supplier_id + '<br/>' +
+         '---------------------------<br/>' +
+         '<b>Cash Tied: $' + Highcharts.numberFormat(p.y, 0) + '</b><br/>' +
+         'Unit Price: $' + Highcharts.numberFormat(p.unit_price, 2) + '<br/>' +
+         'Pressure (MOQ×LT): ' + Highcharts.numberFormat(p.pressure, 0);
+}", clr_red, clr_yellow))) %>%
+  hc_plotOptions(series = list(borderWidth = 0)) %>%
+  hc_add_theme(hc_theme_vscc())
+```
+### 5.7 Margin bridge by market (GM% − CTS%) + Contribution drilldown
+
+```{r}
+bridge <- ceo_stack2 %>%
+  transmute(
+    country_code,
+    gm_pp = gm_pct_w,
+    cts_pp = cts_per_sales,
+    contrib_pp = gm_pp - cts_pp
+  ) %>%
+  arrange(contrib_pp)
+
+highchart() %>%
+  hc_chart(type = "bar") %>%
+  hc_title(text = "Margin Bridge by Market (pp): GM% minus CTS%") %>%
+  hc_xAxis(
+    title = list(text = "Percentage points"),
+    labels = list(format = "{value:.1f}%")
+  ) %>%
+  hc_yAxis(
+    categories = bridge$country_code,
+    title = list(text = "")
+  ) %>%
+  hc_plotOptions(series = list(stacking = "normal")) %>%
+  hc_add_series(name = "GM% (base)", data = bridge$gm_pp, color = COL_BLUE) %>%
+  hc_add_series(name = "CTS/Sales (drag)", data = bridge$cts_pp, color = COL_GRAY_L) %>%
+  hc_tooltip(shared = TRUE, valueSuffix = "%") %>%
+  hc_add_theme(hc_theme_vscc())
+```
+
+```{r}
+# Drilldown: Market -> Category (only if required columns exist)
+mp_top <- market_profit %>%
+  slice_head(n = 10) %>%
+  arrange(contrib_margin_pct) %>%
+  mutate(color = kpi_colors_quantile(contrib_margin_pct, "high_good"))
+
+if (all(c("country_code","category","gross_profit_usd","logistics_cost_usd","sales_usd") %in% names(fact_sales))) {
+  dd_market_cat <- fact_sales %>%
+    group_by(country_code, category) %>%
+    summarise(
+      net_sales = sum(sales_usd, na.rm = TRUE),
+      gross_profit = sum(gross_profit_usd, na.rm = TRUE),
+      logistics_cost = sum(logistics_cost_usd, na.rm = TRUE),
+      contrib_margin_pp = 100 * (gross_profit - logistics_cost) / net_sales,
+      .groups = "drop"
+    )
+
+  mp_top_ids <- mp_top$country_code
+
+  dd_series <- dd_market_cat %>%
+    filter(country_code %in% mp_top_ids) %>%
+    group_by(country_code) %>%
+    summarise(
+      data = list(purrr::map2(category, contrib_margin_pp, ~list(name = .x, y = .y))),
+      .groups = "drop"
+    ) %>%
+    transmute(
+      id = country_code,
+      name = paste0("Breakdown: ", country_code),
+      data = data,
+      type = "bar"
+    )
+
+  mp_main <- mp_top %>%
+    mutate(
+      drilldown = country_code,
+      contrib_margin_pp = 100 * contrib_margin_pct
+    )
+
+  highchart() %>%
+    hc_chart(type = "bar") %>%
+    hc_title(text = "Contribution Margin Proxy by Market → Drilldown by Category") %>%
+    hc_subtitle(text = "Proxy = (Gross profit − Outbound CTS) / Net sales") %>%
+    hc_xAxis(type = "category") %>%
+    hc_yAxis(
+      title = list(text = "Contribution margin (proxy)") ,
+      labels = list(format = "{value:.1f}%")
+    ) %>%
+    hc_add_series(
+      name = "Market",
+      data = purrr::pmap(
+        list(mp_main$country_code, mp_main$contrib_margin_pp, mp_main$color, mp_main$drilldown),
+        ~list(name = ..1, y = ..2, color = ..3, drilldown = ..4)
+      )
+    ) %>%
+    hc_tooltip(pointFormat = "<b>{point.y:.1f}%</b><br/>Click to drill down") %>%
+    hc_drilldown(allowPointDrilldown = TRUE, series = list_parse(dd_series)) %>%
+    hc_add_theme(hc_theme_vscc())
+}
+```
+
+### 5.8 OTIF vs GM (quadrants; bubble = sales; color = CTS pressure)
+
+```{r}
+# Bubble = market (country)
+#   x = OTIF (%)
+#   y = GM% (weighted)
+#   size (z) = Net sales (USD)
+#   colorAxis = CTS/Sales (%) using traffic thresholds
+
+stopifnot(all(c("country_code","net_sales","otif_w","gm_pct_w","cts_per_sales") %in% names(ceo_stack2)))
+
+df <- ceo_stack2 %>%
+  transmute(
+    market = country_code,
+    net_sales = as.numeric(net_sales),
+    otif = as.numeric(otif_w),
+    gm = as.numeric(gm_pct_w),
+    cts = as.numeric(cts_per_sales)
+  ) %>%
+  filter(!is.na(market), !is.na(net_sales), !is.na(otif), !is.na(gm))
+
+otif_mid <- median(df$otif, na.rm = TRUE)
+gm_mid   <- median(df$gm, na.rm = TRUE)
+
+# Strategic context label
+df <- df %>%
+  mutate(
+    quadrant = case_when(
+      otif >= otif_mid & gm >= gm_mid ~ "Star (protect & scale)",
+      otif >= otif_mid & gm <  gm_mid ~ "Service OK; margin weak (fix CTS/price)",
+      otif <  otif_mid & gm >= gm_mid ~ "Margin OK; service weak (fix OTIF)",
+      TRUE                            ~ "At risk (reprioritize)"
+    )
+  )
+
+# Explicit point objects to avoid "undefined"
+pts <- purrr::pmap(
+  df,
+  function(market, net_sales, otif, gm, cts, quadrant, ...) {
+    list(
+      x = otif,
+      y = gm,
+      z = net_sales,
+      cts = cts,
+      market = market,
+      net_sales = net_sales,
+      quadrant = quadrant,
+      name = market
+    )
+  }
+)
+
+cts_max <- suppressWarnings(max(df$cts, na.rm = TRUE))
+if (!is.finite(cts_max) || cts_max < 6) cts_max <- 6
+
+highchart() %>%
+  hc_title(text = "OTIF vs GM (strategic quadrants)") %>%
+  hc_subtitle(text = "Bubble size = Net sales | Color = CTS/Sales (%)") %>%
+  hc_chart(type = "bubble", zoomType = "xy") %>%
+  hc_xAxis(
+    title = list(text = "OTIF (%)"),
+    plotLines = list(
+      list(value = otif_mid, color = COL_GRAY_L, dashStyle = "Dash", width = 2,
+           label = list(text = paste0("Median ", round(otif_mid,1), "%"), style = list(color = COL_GRAY_L)))
+    )
+  ) %>%
+  hc_yAxis(
+    title = list(text = "GM%"),
+    plotLines = list(
+      list(value = gm_mid, color = COL_GRAY_L, dashStyle = "Dash", width = 2,
+           label = list(text = paste0("Median ", round(gm_mid,2), "%"), style = list(color = COL_GRAY_L)))
+    )
+  ) %>%
+  hc_colorAxis(
+    min = 0,
+    max = cts_max,
+    stops = list(
+      list(0, clr_green),
+      list(3/cts_max, clr_green),
+      list(5/cts_max, clr_yellow),
+      list(min(1, 6/cts_max), clr_red),
+      list(1, clr_red)
+    ),
+    labels = list(format = "{value:.1f}%"),
+    title = list(text = "CTS/Sales (%)")
+  ) %>%
+  hc_add_series(
+    name = "Markets",
+    data = pts,
+    colorKey = "cts"
+  ) %>%
+  hc_plotOptions(
+    bubble = list(minSize = 10, maxSize = 70, opacity = 0.65),
+    series = list(
+      dataLabels = list(
+        enabled = TRUE,
+        allowOverlap = TRUE,
+        formatter = JS("function(){ return this.point.market || this.point.name || ''; }"),
+        style = list(color = clr_navy, textOutline = "none", fontSize = "10px")
+      )
+    )
+  ) %>%
+  hc_tooltip(
+    useHTML = TRUE,
+    formatter = JS(sprintf(
+"function(){
+  var p = this.point || {};
+  var m = p.market || p.name || 'N/A';
+  var cts = p.cts;
+
+  var pressure_txt = '';
+  var col = '%s';
+  if(cts != null){
+    if(cts <= 3){ pressure_txt = 'Low CTS pressure'; col = '%s'; }
+    else if(cts <= 5){ pressure_txt = 'Medium CTS pressure'; col = '%s'; }
+    else { pressure_txt = 'High CTS pressure'; col = '%s'; }
+  }
+
+  return '<b>' + m + '</b><br/>' +
+    'Net sales: <b>$' + Highcharts.numberFormat(p.net_sales,0) + '</b><br/>' +
+    'OTIF: <b>' + Highcharts.numberFormat(p.x,2) + '%%</b><br/>' +
+    'GM: <b>' + Highcharts.numberFormat(p.y,2) + '%%</b><br/>' +
+    'CTS/Sales: <b>' + (cts==null ? 'NA' : Highcharts.numberFormat(cts,2)) + '%%</b><br/>' +
+    (pressure_txt ? ('<span style=\"color:' + col + '\">' + pressure_txt + '</span><br/>') : '') +
+    '<i>' + (p.quadrant || '') + '</i>';
+}", clr_navy, clr_green, clr_yellow, clr_red))
+  ) %>%
+  hc_add_theme(hc_theme_vscc())
+```
+### 5.9 CEO KPI heatmap (risk score 0–100, higher = worse)
+
+```{r}
+norm_0_100 <- function(x){
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(rep(50, length(x)))
+  100 * (x - rng[1]) / (rng[2] - rng[1])
+}
+
+kpi_heat <- ceo_stack2 %>%
+  transmute(
+    country_code,
+    `GM%` = gm_pct_w,
+    `Discount%` = disc_w,
+    `OTIF%` = otif_w,
+    `CTS/Sales%` = cts_per_sales,
+    `Cash gap (days)` = cash_gap_days,
+    `Prod LT (days)` = ttm_prod_w
+  ) %>%
+  pivot_longer(-country_code, names_to = "metric", values_to = "value") %>%
+  group_by(metric) %>%
+  mutate(
+    score_raw = norm_0_100(value),
+    risk = case_when(
+      metric %in% c("GM%","OTIF%") ~ 100 - score_raw,
+      TRUE ~ score_raw
+    )
+  ) %>%
+  ungroup()
+
+countries <- unique(kpi_heat$country_code)
+metrics <- unique(kpi_heat$metric)
+
+heat_dat <- kpi_heat %>%
+  mutate(
+    x = match(metric, metrics) - 1,
+    y = match(country_code, countries) - 1
+  ) %>%
+  transmute(x, y, value = round(risk, 1), raw = value, metric, country_code)
+
+highchart() %>%
+  hc_chart(type = "heatmap") %>%
+  hc_title(text = "CEO KPI Heatmap (Risk 0–100, higher = worse)") %>%
+  hc_xAxis(categories = metrics, title = list(text = "")) %>%
+  hc_yAxis(categories = countries, title = list(text = ""), reversed = TRUE) %>%
+  hc_colorAxis(stops = color_stops(n = 4, colors = c("#FFFFFF", COL_BLUE_L, clr_blue_mid, clr_blue_dark))) %>%
+  hc_add_series(
+    name = "Risk",
+    data = list_parse2(heat_dat),
+    borderWidth = 1,
+    borderColor = "#ffffff"
+  ) %>%
+  hc_tooltip(
+    useHTML = TRUE,
+    pointFormat = paste0(
+      "<b>{point.country_code}</b><br/>",
+      "{point.metric}<br/>Raw: <b>{point.raw}</b><br/>Risk: <b>{point.value}</b>"
+    )
+  ) %>%
+  hc_add_theme(hc_theme_vscc())
+```
+
+### 5.10 Time-to-market proxy (core)
+
+```{r}
+# Time-to-market proxy: weighted production lead time (lower is better)
+ttm <- ceo_stack2 %>%
+  select(country_code, ttm_prod_w) %>%
+  arrange(ttm_prod_w) %>%
+  mutate(
+    bucket = case_when(
+      ttm_prod_w < 14 ~ "GREEN",
+      ttm_prod_w <= 30 ~ "YELLOW",
+      TRUE ~ "RED"
+    )
+  )
+
+# If all markets fall into the same bucket (common in small samples), use relative rank bands for visual separation
+if (dplyr::n_distinct(ttm$bucket) == 1) {
+  ttm <- ttm %>%
+    mutate(
+      bucket = case_when(
+        row_number() <= 2 ~ "GREEN",
+        row_number() <= 4 ~ "YELLOW",
+        TRUE ~ "RED"
+      )
+    )
+}
+
+ttm <- ttm %>%
+  mutate(
+    bar_col = case_when(
+      bucket == "GREEN"  ~ clr_green,
+      bucket == "YELLOW" ~ clr_yellow,
+      TRUE               ~ clr_red
+    )
+  )
+
+hc_510 <- highchart() %>%
+  hc_chart(type = "bar", backgroundColor = "#FFFFFF") %>%
+  hc_title(text = "Time-to-Market Proxy (Core): Weighted Production Lead Time") %>%
+  hc_xAxis(categories = ttm$country_code, title = list(text = NULL)) %>%
+  hc_yAxis(title = list(text = "Days"), gridLineWidth = 1, gridLineColor = "#EEF2F7") %>%
+  hc_add_series(
+    name = "Lead time",
+    data = purrr::pmap(list(ttm$ttm_prod_w, ttm$bar_col),
+                       function(y, color) list(y = y, color = color))
+  ) %>%
+  hc_tooltip(pointFormat = "Lead time: <b>{point.y:.1f} days</b>") %>%
+  hc_plotOptions(series = list(borderWidth = 0)) %>%
+  hc_credits(enabled = FALSE)
+
+hc_510
+```
+
+## 6) Transformation (Dev 2026) + Cap 2%
+
+```{r}
+dev_summary <- dev26 %>%
+  summarise(
+    dev_expected_sales = sum(expected_net_sales_usd, na.rm = TRUE),
+    dev_units = sum(fcst_2026_units, na.rm = TRUE)
+  )
+
+total_2026 <- pnl %>% filter(pnl_usd == "Total Net Sales") %>% pull(fy2026_projected)
+
+cap_table <- tibble(
+  total_net_sales_2026 = total_2026,
+  dev_cap_2026 = total_2026 * 0.02,
+  dev_pipeline = dev_summary$dev_expected_sales,
+  pipeline_vs_cap = dev_summary$dev_expected_sales / (total_2026 * 0.02)
+)
+
+DT::datatable(cap_table, options = list(dom = 't'), rownames = FALSE)
+```
+
+## 7) Readiness scorecard (Stage-gate proxy)
+
+```{r}
+readiness_scorecard <- tibble(
+  metric = c(
+    "Active materials fully compliant (Yes)",
+    "Active materials not-fully compliant (Partial/No)",
+    "Non-China suppliers with score >=4",
+    "China suppliers with score >=4",
+    "China-origin exposure (active materials)"
+  ),
+  value = c(
+    compliance_mix$pct[compliance_mix$compliance_status == "Yes"],
+    sum(compliance_mix$pct[compliance_mix$compliance_status %in% c("Partial","No")], na.rm = TRUE),
+    supplier_readiness$pct_score_ge4[supplier_readiness$is_china == FALSE],
+    supplier_readiness$pct_score_ge4[supplier_readiness$is_china == TRUE],
+    china_exposure$pct_china
+  )
+) %>%
+  mutate(
+    value_pct = value * 100,
+    direction = if_else(metric %in% c("China-origin exposure (active materials)",
+                                     "Active materials not-fully compliant (Partial/No)"),
+                        "low_good", "high_good"),
+    color = if_else(direction == "high_good",
+                    kpi_colors_quantile(value_pct, "high_good"),
+                    kpi_colors_quantile(value_pct, "low_good"))
+  )
+
+hchart(readiness_scorecard, "bar", hcaes(x = metric, y = value_pct, color = color)) %>%
+  hc_title(text = "Readiness Scorecard (Stage-gate proxy)") %>%
+  hc_xAxis(title = list(text = "")) %>%
+  hc_yAxis(title = list(text = "%"), labels = list(format = "{value:.0f}%")) %>%
+  hc_plotOptions(series = list(colorByPoint = TRUE)) %>%
+  hc_tooltip(pointFormat = "<b>{point.y:.1f}%</b>") %>%
+  hc_add_theme(hc_theme_vscc())
+```
+
+## 8) Appendix Tables
+
+```{r}
+DT::datatable(
+  ceo_stack2,
+  options = list(pageLength = 10),
+  rownames = FALSE
+)
+```
+
+```{r}
+DT::datatable(
+  cash_gap_market %>% select(country_code, net_sales, cust_terms_w, supplier_terms_ref, cash_gap_days, cash_tied_proxy),
+  options = list(pageLength = 10),
+  rownames = FALSE
+)
+```
+
+```{r}
+DT::datatable(
+  pnl %>% filter(pnl_usd %in% c("Net Sales - Port","Net Sales - Dev","Total Net Sales","EBITDA","EBIT")),
+  options = list(pageLength = 10),
+  rownames = FALSE
+)
+```
